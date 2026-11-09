@@ -345,12 +345,17 @@ export class TTSController extends EventTarget {
 
   async init() {
     const availableClients = [];
-    if (await this.ttsEdgeClient.init()) {
-      availableClients.push(this.ttsEdgeClient);
-    }
+    // Device engine first: on mobile the OS renderer is the only client that
+    // can reach voices the app cannot ship (MultiTTS packs, vendor engines),
+    // and it never costs a network round trip. Edge stays the fallback for
+    // desktop and for phones with no usable system engine; a remembered
+    // preference still wins over both (TTSUtils below).
     if (this.ttsNativeClient && (await this.ttsNativeClient.init())) {
       availableClients.push(this.ttsNativeClient);
       this.ttsNativeVoices = await this.ttsNativeClient.getAllVoices();
+    }
+    if (await this.ttsEdgeClient.init()) {
+      availableClients.push(this.ttsEdgeClient);
     }
     if (await this.ttsWebClient.init()) {
       availableClients.push(this.ttsWebClient);
@@ -1158,23 +1163,33 @@ export class TTSController extends EventTarget {
 
   async setVoice(voiceId: string, lang: string) {
     this.state = 'setvoice-paused';
-    const useEdgeTTS = !!this.ttsEdgeVoices.find(
-      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
-    );
+    // Same precedence as getVoices(), which lists device voices first: an
+    // empty id means "the default voice", and testing Edge first would route
+    // that default straight back to Edge even when the device has a usable
+    // engine — exactly the bug that made system voices unreachable.
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
-    if (useEdgeTTS) {
-      this.ttsClient = this.ttsEdgeClient;
-      await this.ttsClient.setRate(this.ttsRate);
-    } else if (useNativeTTS) {
+    const useEdgeTTS = !!this.ttsEdgeVoices.find(
+      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
+    );
+    if (useNativeTTS) {
       if (!this.ttsNativeClient) {
         throw new Error('Native TTS client is not available');
       }
       this.ttsClient = this.ttsNativeClient;
       await this.ttsClient.setRate(this.ttsRate);
-    } else {
+    } else if (useEdgeTTS) {
+      this.ttsClient = this.ttsEdgeClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (voiceId !== '') {
       this.ttsClient = this.ttsWebClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else {
+      // Empty id and nothing to match against — a system engine that exposes
+      // no voice list, for instance. Keep whatever init() picked and let it
+      // speak with the engine's own default voice rather than silently
+      // downgrading to the browser engine.
       await this.ttsClient.setRate(this.ttsRate);
     }
     TTSUtils.setPreferredClient(this.ttsClient.name);

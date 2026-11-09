@@ -36,6 +36,13 @@ const TTSEngines = {
   aispeech: 'Aispeech',
 } as Record<string, string>;
 
+// Engine packages that never show up in TTSEngines above. Keep this list to
+// engines we can name with confidence; anything else keeps its raw package id
+// as the group label, which still keeps its voices separated in the picker.
+const ENGINE_LABELS: Record<string, string> = {
+  'org.nobody.multitts': 'MultiTTS',
+};
+
 export class NativeTTSClient implements TTSClient {
   name = 'native-tts';
   initialized = false;
@@ -268,21 +275,41 @@ export class NativeTTSClient implements TTSClient {
     const voiceGroups = new Map<string, TTSVoice[]>();
     filteredVoices.forEach((voice) => {
       const { name, lang } = voice;
-      let groupId = voice.id.split('_')[0]!;
-      if (groupId in TTSEngines) {
-        voice.name = name
-          .replace(`${groupId}_`, '')
+      // Android reports "<engine.package>/<voice.name>" (see
+      // NativeTTSPlugin.get_all_voices); iOS and older builds use the
+      // "<engine>_<lang>-<name>" underscore form. Split on whichever the id
+      // carries: deriving the group from '_' alone put every system voice into
+      // one unlabelled "default" bucket, so vendor engines (MultiTTS and
+      // friends) were indistinguishable in the voice picker.
+      const slashAt = voice.id.indexOf('/');
+      const engineKey = slashAt > 0 ? voice.id.slice(0, slashAt) : voice.id.split('_')[0]!;
+      let groupId = ENGINE_LABELS[engineKey] || engineKey;
+      let displayName = name;
+      if (engineKey in TTSEngines) {
+        displayName = name
+          .replace(`${engineKey}_`, '')
+          .replace(`${lang}-`, '')
+          .replace('Neural', '')
+          .trim();
+      } else if (slashAt > 0) {
+        // Unknown package: show the voice name only — the group label already
+        // says which engine it belongs to.
+        displayName = name
+          .slice(name.indexOf('/') + 1)
           .replace(`${lang}-`, '')
           .replace('Neural', '')
           .trim();
       } else {
         groupId = 'default';
       }
-      voice.name = voice.name.replace('NOT_SET', _('Default'));
+      displayName = displayName.replace('NOT_SET', _('Default'));
       if (!voiceGroups.has(groupId)) {
         voiceGroups.set(groupId, []);
       }
-      voiceGroups.get(groupId)!.push(voice);
+      // Copy rather than mutate: getAllVoices() caches this array, and the
+      // name rewriting above is not idempotent (a second pass over the same
+      // object would slice an already-shortened name).
+      voiceGroups.get(groupId)!.push({ ...voice, name: displayName });
     });
 
     return Array.from(voiceGroups.entries())
