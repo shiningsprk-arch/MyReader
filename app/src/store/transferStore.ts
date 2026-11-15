@@ -8,7 +8,9 @@ export type TransferStatus = 'pending' | 'in_progress' | 'completed' | 'failed' 
 // of a parallel one, but carries its own minimal payload in `audiobook`
 // rather than being looked up from the local library by `bookHash` the way
 // 'book' transfers are (audiobooks have no local library entry).
-export type TransferKind = 'book' | 'audiobook_track';
+// 'file_upload' — a local file picked for upload to MyBooks that is not in the
+// library yet (no Book/hash), so like audiobook tracks it carries its own payload.
+export type TransferKind = 'book' | 'audiobook_track' | 'file_upload';
 /**
  * Why a transfer was cancelled. 'user' = an explicit cancel action;
  * 'policy' = the app cancelled it because MyBooks Cloud is not the
@@ -37,6 +39,14 @@ export interface AudiobookTrackPayload {
   size: number;
 }
 
+// Self-contained payload for a 'file_upload' transfer. `filePath` is a plain
+// filesystem path or a content:// URI; a web File lives only in memory (see
+// TransferManager.queueFileUploads) so it has no path and can't survive a restart.
+export interface FileUploadPayload {
+  filePath?: string;
+  fileName: string;
+}
+
 export interface TransferItem {
   id: string;
   kind: TransferKind;
@@ -59,6 +69,8 @@ export interface TransferItem {
   isBackground: boolean;
   // Present only when kind === 'audiobook_track'.
   audiobook?: AudiobookTrackPayload;
+  // Present only when kind === 'file_upload'.
+  fileUpload?: FileUploadPayload;
 }
 
 interface TransferState {
@@ -99,6 +111,7 @@ interface TransferState {
     displayLabel: string,
     priority?: number,
   ) => string;
+  addFileUploadTransfers: (items: Array<FileUploadPayload & { key: string }>) => string[];
   removeTransfer: (transferId: string) => void;
   updateTransferProgress: (
     transferId: string,
@@ -142,7 +155,11 @@ interface TransferState {
   setActiveCount: (count: number) => void;
 
   // Persistence
-  restoreTransfers: (transfers: Record<string, TransferItem>, isQueuePaused: boolean) => void;
+  restoreTransfers: (
+    transfers: Record<string, TransferItem>,
+    isQueuePaused: boolean,
+    resumeInterrupted?: boolean,
+  ) => void;
 }
 
 const generateTransferId = (): string => {
@@ -158,6 +175,16 @@ const generateTransferId = (): string => {
  */
 export const isFailedLikeTransfer = (t: TransferItem): boolean =>
   t.status === 'failed' || (t.status === 'cancelled' && t.cancelReason !== 'policy');
+
+/**
+ * The single interrupted predicate: rows a previous session left mid-flight
+ * that restoreTransfers downgrades to failed/'Interrupted' (and TransferManager
+ * may revive to pending when autoRetryTransfers is on). `file_upload` rows are
+ * excluded — a crash-interrupted upload never auto-resumes (crash-loop guard).
+ */
+export const isInterruptedTransfer = (t: TransferItem): boolean =>
+  (t.status === 'in_progress' || (t.status === 'pending' && t.retryCount > 0)) &&
+  (t.kind ?? 'book') !== 'file_upload';
 
 export const useTransferStore = create<TransferState>((set, get) => ({
   transfers: {},
@@ -266,6 +293,36 @@ export const useTransferStore = create<TransferState>((set, get) => ({
     }));
 
     return id;
+  },
+
+  addFileUploadTransfers: (items) => {
+    const now = Date.now();
+    const ids: string[] = [];
+    const created: Record<string, TransferItem> = {};
+    for (const { key, filePath, fileName } of items) {
+      const id = generateTransferId();
+      ids.push(id);
+      created[id] = {
+        id,
+        kind: 'file_upload',
+        bookHash: key,
+        bookTitle: fileName,
+        type: 'upload',
+        status: 'pending',
+        progress: 0,
+        totalBytes: 0,
+        transferredBytes: 0,
+        transferSpeed: 0,
+        retryCount: 0,
+        maxRetries: 3,
+        createdAt: now,
+        priority: 10,
+        isBackground: false,
+        fileUpload: { filePath, fileName },
+      };
+    }
+    set((state) => ({ transfers: { ...state.transfers, ...created } }));
+    return ids;
   },
 
   removeTransfer: (transferId) => {
@@ -463,7 +520,7 @@ export const useTransferStore = create<TransferState>((set, get) => ({
 
   setActiveCount: (count) => set({ activeCount: count }),
 
-  restoreTransfers: (transfers, isQueuePaused) => {
+  restoreTransfers: (transfers, isQueuePaused, resumeInterrupted = true) => {
     // Legacy rows persisted before the kind discriminator default to 'book'.
     const restoredTransfers: Record<string, TransferItem> = {};
     Object.entries(transfers).forEach(([id, transfer]) => {
@@ -473,7 +530,31 @@ export const useTransferStore = create<TransferState>((set, get) => ({
       // restore.
       if (transfer.status === 'cancelled' && transfer.cancelReason === 'policy') return;
       const withKind: TransferItem = { ...transfer, kind: transfer.kind ?? 'book' };
-      if (withKind.status === 'in_progress') {
+      // A file upload that was running when the app died never auto-resumes: if it
+      // is what killed the app, resuming would crash-loop. The user retries by hand.
+      if (withKind.kind === 'file_upload' && withKind.status === 'in_progress') {
+        restoredTransfers[id] = {
+          ...withKind,
+          status: 'failed',
+          error: 'Interrupted',
+          progress: 0,
+          transferredBytes: 0,
+          transferSpeed: 0,
+        };
+        return;
+      }
+      const interrupted = isInterruptedTransfer(withKind);
+      if (interrupted && !resumeInterrupted) {
+        // Left for the user to retry by hand.
+        restoredTransfers[id] = {
+          ...withKind,
+          status: 'failed',
+          error: 'Interrupted',
+          progress: 0,
+          transferredBytes: 0,
+          transferSpeed: 0,
+        };
+      } else if (withKind.status === 'in_progress') {
         restoredTransfers[id] = {
           ...withKind,
           status: 'pending',

@@ -111,7 +111,7 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
 
   useEffect(() => {
     if (appService?.isAndroidApp) {
-      eventDispatcher.onSync('native-key-down', handleKeyDown);
+      eventDispatcher.onSync('native-key-down', handleKeyDown, true);
     }
     return () => {
       if (appService?.isAndroidApp) {

@@ -34,6 +34,9 @@ async function cacheCover(url: string, response: Response): Promise<void> {
   } catch {}
 }
 
+// URLs that have already loaded once this session; a remount shows them without a fallback frame.
+const loadedUrls = new Set<string>();
+
 function resolveCoverUrl(book: Book): string | null {
   return book.metadata?.coverImageUrl || book.coverImageUrl || null;
 }
@@ -46,6 +49,26 @@ function resolveCoverUrl(book: Book): string | null {
  */
 export function isRemoteCoverUrl(coverUrl: string): boolean {
   return isTauriAppPlatform() && isRemoteImageUrl(coverUrl);
+}
+
+// Local covers on Tauri live behind the asset:// protocol. WKWebView loads such an <img>
+// once, then fails every later load of the same URL (fetch() on it keeps working), so they
+// are rendered from a blob object URL like remote covers.
+function isLocalAssetCoverUrl(coverUrl: string): boolean {
+  return isTauriAppPlatform() && /^(asset:|https?:\/\/asset\.localhost)/.test(coverUrl);
+}
+
+const needsBlobCover = (coverUrl: string): boolean =>
+  isRemoteCoverUrl(coverUrl) || isLocalAssetCoverUrl(coverUrl);
+
+// The path of a local cover never changes when it is replaced, so key it by updatedAt too.
+const coverCacheKey = (book: Book, coverUrl: string): string =>
+  isLocalAssetCoverUrl(coverUrl) ? `${coverUrl}#${book.updatedAt ?? 0}` : coverUrl;
+
+async function fetchLocalCoverObjectUrl(coverUrl: string): Promise<string> {
+  const response = await fetch(coverUrl);
+  if (!response.ok) throw new Error(`Local cover request failed with status ${response.status}`);
+  return URL.createObjectURL(await response.blob());
 }
 
 /**
@@ -143,8 +166,10 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
     onAspectRatioChange,
   }) => {
     const coverRef = useRef<HTMLDivElement>(null);
-    const [imageLoaded, setImageLoaded] = useState(false);
-    const [imageError, setImageError] = useState(false);
+    // Loaded/failed are tracked per URL, so a remount or URL change never shows a stale state.
+    const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
+    const [erroredUrl, setErroredUrl] = useState<string | null>(null);
+    const [fetchFailed, setFetchFailed] = useState(false);
     // Lazily resolved so a book whose cover is already known synchronously
     // (a local asset URL, or a remote cover already decoded by an earlier
     // mount) paints with its real cover on the very first render instead of
@@ -155,40 +180,33 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
     const [displayImageUrl, setDisplayImageUrl] = useState<string | null>(() => {
       const coverUrl = resolveCoverUrl(book);
       if (!coverUrl) return null;
-      if (!isRemoteCoverUrl(coverUrl)) return coverUrl;
-      return peekCachedCoverObjectUrl(coverUrl) ?? null;
+      if (!needsBlobCover(coverUrl)) return coverUrl;
+      return peekCachedCoverObjectUrl(coverCacheKey(book, coverUrl)) ?? null;
     });
 
+    const imageLoaded =
+      !!displayImageUrl && (loadedUrl === displayImageUrl || loadedUrls.has(displayImageUrl));
+    const imageError = !!displayImageUrl && erroredUrl === displayImageUrl;
     const shouldShowSpine = showSpine && imageLoaded && !imageError;
 
-    const toggleImageVisibility = (showImage: boolean) => {
-      if (coverRef.current) {
-        const coverImage = coverRef.current.querySelector('.cover-image');
-        const fallbackCover = coverRef.current.querySelector('.fallback-cover');
-        if (coverImage) {
-          coverImage.classList.toggle('invisible', !showImage);
-        }
-        if (fallbackCover) {
-          fallbackCover.classList.toggle('invisible', showImage);
-        }
-      }
-    };
-
-    const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
-      setImageLoaded(true);
-      setImageError(false);
-      toggleImageVisibility(true);
-      const img = e.currentTarget;
+    const markLoaded = (img: HTMLImageElement) => {
+      if (displayImageUrl) loadedUrls.add(displayImageUrl);
+      setLoadedUrl(displayImageUrl);
       if (onAspectRatioChange && img.naturalWidth > 0 && img.naturalHeight > 0) {
         onAspectRatioChange(img.naturalWidth / img.naturalHeight);
       }
     };
 
     const handleImageError = () => {
-      setImageLoaded(false);
-      setImageError(true);
-      toggleImageVisibility(false);
+      setErroredUrl(displayImageUrl);
       onImageError?.();
+    };
+
+    // A cached image can finish loading before React attaches onLoad; catch that case here.
+    const imageRef = (img: HTMLImageElement | null) => {
+      if (img && img.complete && img.naturalWidth > 0 && loadedUrl !== displayImageUrl) {
+        markLoaded(img);
+      }
     };
 
     useEffect(() => {
@@ -201,47 +219,51 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
         book.hash,
         `BookCover: resolved=${coverUrl ?? '(none)'} book.coverImageUrl=${book.coverImageUrl ?? '(none)'} metadata.coverImageUrl=${book.metadata?.coverImageUrl ?? '(none)'}`,
       );
-      if (!coverUrl) {
-        toggleImageVisibility(false);
-        return;
-      }
+      if (!coverUrl) return;
 
-      if (!isRemoteCoverUrl(coverUrl)) {
+      if (!needsBlobCover(coverUrl)) {
         setDisplayImageUrl(coverUrl);
-        toggleImageVisibility(true);
         return;
       }
 
-      const cached = peekCachedCoverObjectUrl(coverUrl);
+      const cacheKey = coverCacheKey(book, coverUrl);
+      const cached = peekCachedCoverObjectUrl(cacheKey);
       if (cached) {
         setDisplayImageUrl(cached);
-        toggleImageVisibility(true);
         return;
       }
 
+      setFetchFailed(false);
       let cancelled = false;
       const { title, hash } = book;
 
-      getOrCreateCoverObjectUrl(coverUrl, () => fetchRemoteCoverObjectUrl(coverUrl, title, hash))
+      const createObjectUrl = () =>
+        isLocalAssetCoverUrl(coverUrl)
+          ? fetchLocalCoverObjectUrl(coverUrl)
+          : fetchRemoteCoverObjectUrl(coverUrl, title, hash);
+
+      getOrCreateCoverObjectUrl(cacheKey, createObjectUrl)
         .then((objectUrl) => {
           if (cancelled) return;
           setDisplayImageUrl(objectUrl);
-          toggleImageVisibility(true);
         })
         .catch((error: unknown) => {
           if (cancelled) return;
+          setFetchFailed(true);
           const errorMsg = `[BookCover] Failed to fetch remote cover for book: ${title} (${hash}): ${error}`;
           console.error(errorMsg);
           tauriError(errorMsg).catch(() => {});
-          toggleImageVisibility(false);
         });
 
       return () => {
         cancelled = true;
       };
-    }, [book.metadata?.coverImageUrl, book.coverImageUrl, book.hash, book.title]);
+    }, [book.metadata?.coverImageUrl, book.coverImageUrl, book.hash, book.title, book.updatedAt]);
 
     const hasDisplayUrl = !!displayImageUrl;
+    // Title text is only for covers that don't exist or failed; while one is still
+    // loading we leave the cell blank, so a loading cover doesn't flash title -> image.
+    const showFallback = !resolveCoverUrl(book) || fetchFailed || imageError;
 
     return (
       <div
@@ -255,10 +277,17 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
                 src={displayImageUrl!}
                 alt={book.title}
                 fill={true}
-                loading='lazy'
+                loading='eager'
+                decoding='async'
+                ref={imageRef}
                 draggable={false}
-                className={clsx('cover-image crop-cover-img object-cover', imageClassName)}
-                onLoad={handleImageLoad}
+                className={clsx(
+                  'cover-image crop-cover-img object-cover transition-opacity duration-150',
+                  !imageLoaded && 'opacity-0',
+                  imageError && 'invisible',
+                  imageClassName,
+                )}
+                onLoad={(e) => markLoaded(e.currentTarget)}
                 onError={handleImageError}
               />
             )}
@@ -281,13 +310,17 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
                   width={0}
                   height={0}
                   sizes='100vw'
-                  loading='lazy'
+                  loading='eager'
+                  decoding='async'
+                  ref={imageRef}
                   draggable={false}
                   className={clsx(
-                    'cover-image fit-cover-img h-auto max-h-full w-auto max-w-full shadow-md',
+                    'cover-image fit-cover-img h-auto max-h-full w-auto max-w-full shadow-md transition-opacity duration-150',
+                    !imageLoaded && 'opacity-0',
+                    imageError && 'invisible',
                     imageClassName,
                   )}
-                  onLoad={handleImageLoad}
+                  onLoad={(e) => markLoaded(e.currentTarget)}
                   onError={handleImageError}
                 />
               )}
@@ -300,11 +333,11 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
 
         <div
           className={clsx(
-            'fallback-cover invisible absolute inset-0 p-2',
+            'fallback-cover absolute inset-0 p-2',
             'text-neutral-content text-center font-serif font-medium',
             isPreview ? 'bg-base-200/50' : 'bg-base-100',
             imageClassName,
-            !hasDisplayUrl && '!visible',
+            !showFallback && 'invisible',
           )}
         >
           <div className='flex h-1/2 items-center justify-center'>

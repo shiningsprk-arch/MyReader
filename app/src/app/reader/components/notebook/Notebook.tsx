@@ -8,6 +8,8 @@ import { useBookDataStore } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { useNotebookStore } from '@/store/notebookStore';
+import { useMyNexusAvailability, useMyNexusEnabled, useMyNexusStore } from '@/store/myNexusStore';
+import { NotebookTab } from '@/store/notebookStore';
 import { useAIChatStore } from '@/store/aiChatStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useThemeStore } from '@/store/themeStore';
@@ -36,12 +38,14 @@ import {
   expandAllRenderedSections,
   removeGlobalAnnotationOverlays,
 } from '../../utils/globalAnnotations';
+import { removeAiSelectionMarker } from '../../utils/aiSelectionMarker';
 import BooknoteItem from '../sidebar/BooknoteItem';
 import AIAssistant from './AIAssistant';
 import NotebookHeader from './Header';
 import NoteEditor from './NoteEditor';
 import SearchBar from './SearchBar';
 import NotebookTabNavigation from './NotebookTabNavigation';
+import MyNexusChatPanel from '../mynexus/MyNexusChatPanel';
 import EmptyState from '../EmptyState';
 
 const MIN_NOTEBOOK_WIDTH = 0.15;
@@ -63,6 +67,21 @@ const Notebook: React.FC = ({}) => {
   const { setNotebookNewAnnotation, setNotebookNewHighlightId } = useNotebookStore();
   const { setNotebookEditAnnotation, setNotebookActiveTab } = useNotebookStore();
   const { activeConversationId } = useAIChatStore();
+  const bookId = sideBarBookKey ? getBookData(sideBarBookKey)?.book?.bookId : undefined;
+  const mynexusEnabled = useMyNexusEnabled();
+  const companionAvailable = useMyNexusAvailability(bookId);
+  // Books without MyNexus support have no companion panel. Fall back to notes
+  // instead of rendering MyNexusChatPanel for them, even if the persisted tab
+  // was left on 'companion' (the toolbar and tab navigation already hide their
+  // own AI-chat entries for these books).
+  const activeTab: NotebookTab =
+    notebookActiveTab === 'companion' && !(mynexusEnabled && companionAvailable)
+      ? 'notes'
+      : notebookActiveTab;
+  // AI companion always floats over the reading area, so it is never pinned
+  // even when the notebook's own pin setting is on.
+  const isCompanionTab = activeTab === 'companion';
+  const effectivePinned = isNotebookPinned && !isCompanionTab;
   const currentUserId = useMyBooksStatusStore((state) => state.currentUserId);
   const isOwnNote = useCallback(
     (note: BookNote) => !note.userId || note.userId === String(currentUserId),
@@ -150,7 +169,7 @@ const Notebook: React.FC = ({}) => {
     saveSysSettings(envConfig, 'globalReadSettings', newGlobalReadSettings);
   };
 
-  const handleTabChange = (tab: 'notes' | 'ai') => {
+  const handleTabChange = (tab: NotebookTab) => {
     setNotebookActiveTab(tab);
     const globalReadSettings = settings.globalReadSettings;
     const newGlobalReadSettings = { ...globalReadSettings, notebookActiveTab: tab };
@@ -209,6 +228,19 @@ const Notebook: React.FC = ({}) => {
   useEffect(() => {
     return () => handleCancelNewAnnotation(sideBarBookKey);
   }, [sideBarBookKey, handleCancelNewAnnotation]);
+
+  // The AI-chat entry stages a quoted passage and draws a temporary highlight.
+  // Both live only while the companion panel presents that same book; closing
+  // the notebook, switching tabs or books must not leave a stale marker behind.
+  useEffect(() => {
+    const pending = useMyNexusStore.getState().pendingSelection;
+    if (!pending) return;
+    const active =
+      isNotebookVisible && activeTab === 'companion' && pending.bookKey === sideBarBookKey;
+    if (active) return;
+    removeAiSelectionMarker(getView(pending.bookKey), pending.bookKey);
+    useMyNexusStore.getState().clearPendingSelection();
+  }, [isNotebookVisible, activeTab, sideBarBookKey, getView]);
 
   const handleClickOverlay = () => {
     setNotebookVisible(false);
@@ -369,7 +401,7 @@ const Notebook: React.FC = ({}) => {
 
   return isNotebookVisible ? (
     <>
-      {!isNotebookPinned && (
+      {!effectivePinned && (
         <Overlay
           className={clsx('z-[45]', viewSettings?.isEink ? '' : 'bg-black/50 sm:bg-black/20')}
           onDismiss={handleClickOverlay}
@@ -382,8 +414,8 @@ const Notebook: React.FC = ({}) => {
           'full-height font-sans text-base font-normal transition-[padding-top] duration-300 sm:text-sm',
           viewSettings?.isEink ? 'bg-base-100' : 'bg-base-200',
           appService?.hasRoundedWindow && 'rounded-window-top-right rounded-window-bottom-right',
-          isNotebookPinned ? 'z-20' : 'z-[45] shadow-2xl',
-          !isNotebookPinned && viewSettings?.isEink && 'border-base-content border-s',
+          effectivePinned ? 'z-20' : 'z-[45] shadow-2xl',
+          !effectivePinned && viewSettings?.isEink && 'border-base-content border-s',
         )}
         role='group'
         aria-label={_('Notebook')}
@@ -391,7 +423,7 @@ const Notebook: React.FC = ({}) => {
         style={{
           width: isMobile ? '100%' : `${notebookWidth}`,
           maxWidth: isMobile ? '100%' : `${MAX_NOTEBOOK_WIDTH * 100}%`,
-          position: isMobile ? 'fixed' : isNotebookPinned ? 'relative' : 'absolute',
+          position: isMobile ? 'fixed' : effectivePinned ? 'relative' : 'absolute',
           paddingTop: `${getPanelTopInset({
             isMobile,
             isFullHeightInMobile,
@@ -442,14 +474,16 @@ const Notebook: React.FC = ({}) => {
             </div>
           )}
           <NotebookHeader
-            isPinned={isNotebookPinned}
-            isSearchBarVisible={isSearchBarVisible && notebookActiveTab === 'notes'}
+            isPinned={effectivePinned}
+            isSearchBarVisible={isSearchBarVisible && activeTab === 'notes'}
             handleClose={() => setNotebookVisible(false)}
             handleTogglePin={handleTogglePin}
             handleToggleSearchBar={handleToggleSearchBar}
-            showSearchButton={notebookActiveTab === 'notes'}
+            showSearchButton={activeTab === 'notes'}
+            showPinButton={!isCompanionTab}
+            isCompanionTab={isCompanionTab}
           />
-          {notebookActiveTab === 'notes' && (
+          {activeTab === 'notes' && (
             <div
               className={clsx('search-bar', {
                 'search-bar-visible': isSearchBarVisible,
@@ -464,9 +498,13 @@ const Notebook: React.FC = ({}) => {
             </div>
           )}
         </div>
-        {notebookActiveTab === 'ai' ? (
+        {activeTab === 'ai' ? (
           <div className='flex min-h-0 flex-1 flex-col'>
             <AIAssistant key={activeConversationId ?? 'new'} bookKey={sideBarBookKey} />
+          </div>
+        ) : activeTab === 'companion' ? (
+          <div className='flex min-h-0 flex-1 flex-col'>
+            <MyNexusChatPanel bookKey={sideBarBookKey} />
           </div>
         ) : isNotesTabEmpty ? (
           <div className='flex flex-grow items-center justify-center overflow-y-auto px-3'>
@@ -586,7 +624,11 @@ const Notebook: React.FC = ({}) => {
             paddingBottom: `${(safeAreaInsets?.bottom || 0) / 2}px`,
           }}
         >
-          <NotebookTabNavigation activeTab={notebookActiveTab} onTabChange={handleTabChange} />
+          <NotebookTabNavigation
+            activeTab={activeTab}
+            onTabChange={handleTabChange}
+            bookKey={sideBarBookKey}
+          />
         </div>
       </div>
     </>

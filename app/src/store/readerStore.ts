@@ -37,6 +37,33 @@ import { useLibraryStore } from './libraryStore';
 import { clearBookProgress, getBookProgress, setBookProgress } from './readerProgressStore';
 import { uniqueId } from '@/utils/misc';
 
+// Debug switch: logs load/parse cost when opening a book.
+const DEBUG_OPEN_TIMING = true;
+
+// An 'unread' book only becomes 'reading' after it has stayed open this long.
+const READING_STATUS_DELAY_MS = 30_000;
+const readingStatusTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const scheduleReadingStatus = (hash: string) => {
+  if (readingStatusTimers.has(hash)) return;
+  readingStatusTimers.set(
+    hash,
+    setTimeout(() => {
+      readingStatusTimers.delete(hash);
+      const { getBookByHash, updateBookProgress } = useLibraryStore.getState();
+      const book = getBookByHash(hash);
+      if (book?.readingStatus === 'unread' && book.progress) {
+        updateBookProgress(hash, book.progress, undefined);
+      }
+    }, READING_STATUS_DELAY_MS),
+  );
+};
+
+const cancelReadingStatus = (hash: string) => {
+  clearTimeout(readingStatusTimers.get(hash));
+  readingStatusTimers.delete(hash);
+};
+
 interface ViewState {
   /* Unique key for each book view */
   key: string;
@@ -151,6 +178,10 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     set((state) => {
       const viewStates = { ...state.viewStates };
       delete viewStates[key];
+      const hash = getBookHash(key);
+      if (!Object.keys(viewStates).some((k) => getBookHash(k) === hash)) {
+        cancelReadingStatus(hash);
+      }
       return { viewStates };
     });
   },
@@ -162,6 +193,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     isPrimary = true,
     reload = false,
   ) => {
+    if (DEBUG_OPEN_TIMING) performance.mark(`open-start:${key}`);
     const booksData = useBookDataStore.getState().booksData;
     const bookData = booksData[id];
     set((state) => ({
@@ -231,6 +263,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           // EPUB prefetch), so it can race the content load instead of
           // queueing behind it — one fewer serial IPC round trip on the
           // critical path.
+          const loadStartedAt = performance.now();
           const [content, nativeFilePath] = await Promise.all([
             appService.loadBookContent(book) as Promise<BookContent>,
             appService.resolveNativeBookFilePath(book).catch((err: unknown) => {
@@ -239,12 +272,20 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             }),
           ]);
           file = content.file;
+          const openStartedAt = performance.now();
           const doc = await new DocumentLoader(file, {
             nativeFilePath: nativeFilePath ?? undefined,
           }).open();
+          if (DEBUG_OPEN_TIMING) {
+            const now = performance.now();
+            console.log(
+              `[open-perf][${book.format}][${(file.size / 1048576).toFixed(1)}MB] load=${(openStartedAt - loadStartedAt).toFixed(0)}ms parse=${(now - openStartedAt).toFixed(0)}ms`,
+            );
+          }
           bookDoc = doc.book;
         }
       }
+      const stageAt = performance.now();
       const config = await configPromise;
       // Import annotations from third-party readers on first open. The
       // module import was already kicked off above; providers still run
@@ -268,11 +309,15 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       // Filter out invalid booknotes
       config.booknotes = config.booknotes?.filter((booknote) => booknote.cfi) ?? [];
       // Load cached book navigation (TOC + section fragments) or compute and persist.
+      const navStartedAt = performance.now();
+      let navSource = 'skip';
       if (book.format === 'EPUB' && bookDoc.rendition?.layout !== 'pre-paginated') {
         const cachedNav = await appService.loadBookNav(book);
         if (cachedNav?.version === BOOK_NAV_VERSION && process.env.NODE_ENV === 'production') {
           hydrateBookNav(bookDoc, cachedNav);
+          navSource = 'cache';
         } else {
+          navSource = 'compute';
           const freshNav = await computeBookNav(bookDoc);
           hydrateBookNav(bookDoc, freshNav);
           try {
@@ -282,11 +327,18 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           }
         }
       }
+      const tocStartedAt = performance.now();
       await updateToc(
         bookDoc,
         config.viewSettings?.sortedTOC ?? false,
         config.viewSettings?.convertChineseVariant ?? 'none',
       );
+      if (DEBUG_OPEN_TIMING) {
+        const now = performance.now();
+        console.log(
+          `[open-perf][stages] config+annot=${(navStartedAt - stageAt).toFixed(0)}ms nav(${navSource})=${(tocStartedAt - navStartedAt).toFixed(0)}ms toc=${(now - tocStartedAt).toFixed(0)}ms`,
+        );
+      }
       if (!bookDoc.metadata.title && file) {
         bookDoc.metadata.title = getBaseFilename(file.name);
       }
@@ -300,7 +352,10 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       // without this they'd stay stuck on the placeholder even after the
       // file opens and its real metadata is known.
       if (book.storageType === 'cloud' && !book.downloadedAt) {
-        book.title = book.sourceTitle;
+        // MyBooks' title is user-curated; the embedded entry point passes it
+        // in and it also lands in metadata via the book-detail endpoint.
+        const cloudTitle = book.metadata?.title;
+        book.title = cloudTitle ? formatTitle(cloudTitle) : book.sourceTitle;
         if (bookDoc.metadata.author) {
           book.author = formatAuthors(bookDoc.metadata.author, bookDoc.metadata.language);
         }
@@ -456,7 +511,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     if (existingBook) {
       let newReadingStatus = existingBook.readingStatus;
       if (existingBook.readingStatus === 'unread') {
-        newReadingStatus = undefined;
+        scheduleReadingStatus(id);
       }
       if (progressPercentage >= 100 && existingBook.readingStatus !== 'finished') {
         newReadingStatus = 'finished';

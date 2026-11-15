@@ -3,8 +3,10 @@
  * 提供与 MyReader 后端 API 的交互能力
  */
 
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { isTauriAppPlatform } from '@/services/environment';
+import { logTime } from '@/utils/misc';
 import { useMyBooksStatusStore } from '@/store/mybooksStatusStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useNasDeviceStore } from '@/store/nasDeviceStore';
@@ -55,6 +57,9 @@ export interface MyBooksBook {
   ext_link: string;
   files: Array<{ format: string; size: number; href: string }>;
   dynamic_cover: number;
+  // Whether MyBooks' MyNexus AI companion is usable for this book (login required).
+  ai_companion_available?: boolean;
+  ai_reading_guide?: string;
 }
 
 export interface MyBooksMetaItem {
@@ -151,6 +156,8 @@ export interface MyBooksSysInfo {
   upgrable: string;
   defaultPageSize: number;
   aiEnabled: boolean;
+  // Whether the whole site has MyNexus AI companion switched on (MYNEXUS_ENABLE).
+  mynexus_enabled?: boolean;
   // Whether the site has invite-code mode on. A successful /user/info doesn't
   // mean the client's own explicit `mybooks_tauri_cookie` store actually has
   // `invited` in it — see accessCodeRefresh.ts / LibraryHeader.tsx.
@@ -229,6 +236,12 @@ export interface MyBooksResponse<T = unknown> {
   book_status?: MyBooksReadingStatsBookStatus;
   // /book/<id>/reading_stats — document/MyBooks_WebAPI.md §3.49
   stats?: MyBooksBookReadingStat[];
+  // /book/<id>/mynexus/* — document/MyBooks_WebAPI.md §3.66
+  available?: boolean;
+  reading_guide?: string;
+  session_id?: string | null;
+  messages?: MyNexusChatMessage[];
+  tool_result?: { tool_name?: string; result_json?: string };
 }
 
 // Thrown when MyReader responded but reported a logical error (e.g. not logged
@@ -250,6 +263,100 @@ export class MyBooksApiError extends Error {
 const MYBOOKS_REQUEST_TIMEOUT_MS = 5000;
 const MYBOOKS_REQUEST_MAX_RETRIES = 3;
 const MYBOOKS_RETRY_DELAY_MS = 300;
+export const MYBOOKS_UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Debug switch: flip to true by hand when building a test package; off by default.
+// Logs one `[status][cost][method][path]` line per request.
+const DEBUG_REQUEST_TIMING = true;
+
+export interface MyNexusReadingContext {
+  book_title?: string;
+  chapter_title?: string;
+  chapter_href?: string;
+  section_index?: number;
+  progress_fraction?: number;
+  page?: number;
+  cfi?: string;
+  snippet?: string;
+}
+
+export interface MyNexusSelectionContext {
+  text: string;
+  chapter_title?: string;
+  chapter_href?: string;
+  section_index?: number;
+  page?: number;
+  progress_fraction?: number;
+  cfi?: string;
+}
+
+export interface MyNexusMessageContext {
+  reading?: MyNexusReadingContext;
+  selection?: MyNexusSelectionContext;
+}
+
+export interface MyNexusChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  citations?: { content: string }[];
+  // Raw persisted frames as returned by /mynexus/session history.
+  tool_results?: { tool_name?: string; result_json?: string }[];
+  // Normalized generate_mindmap frame the panel renders, filled from
+  // either the live SSE stream or the replayed tool_results above.
+  toolResult?: { toolName?: string; resultJson?: string };
+  // Reading position / selected passage snapshot captured when the message
+  // was sent; only user messages carry it.
+  context?: MyNexusMessageContext;
+}
+
+interface ResolvedMyBooksRequest {
+  url: URL;
+  fetchFn: typeof fetch;
+  host: string | null;
+}
+
+// Tauri talks to the MyBooks host directly (plugin-http manages cookies); Web
+// mode routes through the Next.js proxy so CORS / mixed content is bypassed.
+function resolveMyBooksRequest(endpoint: string): ResolvedMyBooksRequest {
+  const host = typeof window !== 'undefined' ? localStorage.getItem('mybooks_host') : null;
+  if (host && isTauriAppPlatform()) {
+    const normalizedHost = host.endsWith('/') ? host.slice(0, -1) : host;
+    return {
+      url: new URL(`${normalizedHost}/api${endpoint}`),
+      fetchFn: tauriFetch as unknown as typeof fetch,
+      host,
+    };
+  }
+  if (host) {
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
+    const url = new URL(`/api/mybooks/proxy/${cleanEndpoint}`, window.location.origin);
+    url.searchParams.set('host', host);
+    return { url, fetchFn: fetch, host };
+  }
+  return {
+    url: new URL(
+      `/api${endpoint}`,
+      typeof window !== 'undefined' ? window.location.origin : 'http://localhost',
+    ),
+    fetchFn: fetch,
+    host: null,
+  };
+}
+
+// Tauri only: plugin-http's cookie jar is separate from the WebView's, so the
+// NAS session cookies must be attached explicitly (see fetchMyBooks).
+function attachNasCookieHeaders(fetchOptions: RequestInit, url: URL, host: string | null): void {
+  if (!host || !isTauriAppPlatform()) return;
+  const nasSettings = useSettingsStore.getState().settings.nas;
+  if (!nasSettings?.enabled) return;
+  fetchOptions.headers = {
+    ...fetchOptions.headers,
+    ...buildMyBooksCookieHeaders(url.toString()),
+  };
+  if (shouldAutoPromptNasLogin(nasSettings)) {
+    useNasDeviceStore.getState().requestPrompt();
+  }
+}
 
 export async function fetchMyBooks<T>(
   endpoint: string,
@@ -258,31 +365,9 @@ export async function fetchMyBooks<T>(
   body?: BodyInit | null,
   contentType?: string,
   timeoutMs: number = MYBOOKS_REQUEST_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<MyBooksResponse<T>> {
-  const host = typeof window !== 'undefined' ? localStorage.getItem('mybooks_host') : null;
-
-  let url: URL;
-  let fetchFn: typeof fetch;
-
-  if (host && isTauriAppPlatform()) {
-    // Tauri: direct request — the Tauri HTTP plugin manages cookies natively.
-    const normalizedHost = host.endsWith('/') ? host.slice(0, -1) : host;
-    url = new URL(`${normalizedHost}/api${endpoint}`);
-    fetchFn = tauriFetch as unknown as typeof fetch;
-  } else if (host) {
-    // Web mode: route through the Next.js proxy so the browser cookie is set
-    // on the Readest origin and CORS / mixed-content issues are bypassed.
-    const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
-    url = new URL(`/api/mybooks/proxy/${cleanEndpoint}`, window.location.origin);
-    url.searchParams.set('host', host);
-    fetchFn = fetch;
-  } else {
-    url = new URL(
-      `/api${endpoint}`,
-      typeof window !== 'undefined' ? window.location.origin : 'http://localhost',
-    );
-    fetchFn = fetch;
-  }
+  const { url, fetchFn, host } = resolveMyBooksRequest(endpoint);
 
   if (params) {
     Object.entries(params).forEach(([key, value]) => {
@@ -310,28 +395,25 @@ export async function fetchMyBooks<T>(
   // NAS-gated request would authenticate at the relay but arrive at MyBooks
   // itself with no session cookie at all, failing as "not logged in" even
   // though the user is.
-  if (host && isTauriAppPlatform()) {
-    const nasSettings = useSettingsStore.getState().settings.nas;
-    if (nasSettings?.enabled) {
-      fetchOptions.headers = {
-        ...fetchOptions.headers,
-        ...buildMyBooksCookieHeaders(url.toString()),
-      };
-      if (shouldAutoPromptNasLogin(nasSettings)) {
-        useNasDeviceStore.getState().requestPrompt();
-      }
-    }
-  }
+  attachNasCookieHeaders(fetchOptions, url, host);
 
   let result: MyBooksResponse<T>;
   let attempt = 0;
   for (;;) {
     const controller = new AbortController();
+    // Merge the caller's signal into this attempt's controller by hand:
+    // browserslist is chrome 92, so AbortSignal.any can't be relied on.
+    const onAbort = () => controller.abort();
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
     fetchOptions.signal = controller.signal;
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = performance.now();
+    let status: number | string = 'ERR';
 
     try {
       const response = await fetchFn(url.toString(), fetchOptions);
+      status = response.status;
       // Opportunistically keep `mybooks_tauri_cookie` (the store the native
       // downloader and WS sync channel read explicitly — see
       // tauriCookieStore.ts) in sync with whatever session is actually live,
@@ -354,6 +436,11 @@ export async function fetchMyBooks<T>(
       break;
     } catch (error) {
       attempt++;
+      // A caller abort is not a network failure: surface it at once, with no
+      // retry and no offline flag.
+      if (signal?.aborted) {
+        throw error;
+      }
       if (attempt <= MYBOOKS_REQUEST_MAX_RETRIES) {
         await new Promise((resolve) => setTimeout(resolve, MYBOOKS_RETRY_DELAY_MS * attempt));
         continue;
@@ -373,6 +460,13 @@ export async function fetchMyBooks<T>(
       throw error;
     } finally {
       clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onAbort);
+      if (DEBUG_REQUEST_TIMING) {
+        const cost = (performance.now() - startedAt).toFixed(2);
+        console.log(
+          `[MyBooks][${logTime()}][${status}][${cost}ms][${method}][${url.pathname}${url.search}]`,
+        );
+      }
     }
   }
   if (host) useMyBooksStatusStore.getState().setOffline(false);
@@ -383,6 +477,85 @@ export async function fetchMyBooks<T>(
 
   return result;
 }
+
+export interface MyBooksUploadFile {
+  field: string;
+  filePath: string;
+  fileName: string;
+}
+
+/**
+ * Tauri only: multipart upload streamed from disk by Rust, so file bytes never
+ * enter the webview. reqwest there has no cookie jar, so the session (and NAS)
+ * cookies are passed explicitly, and any Set-Cookie in the reply is merged back.
+ * `options.signal` aborts the in-flight upload: it triggers the Rust-side
+ * `cancel_upload` for this invocation's id and rejects this promise at once.
+ */
+export async function uploadMyBooksFilesNative<T>(
+  endpoint: string,
+  files: MyBooksUploadFile[],
+  fields: [string, string][] = [],
+  onProgress?: (p: { progress: number; total: number }) => void,
+  options?: { signal?: AbortSignal },
+): Promise<MyBooksResponse<T>> {
+  const host = localStorage.getItem('mybooks_host');
+  if (!host) throw new Error('MyReader host not configured');
+  const url = `${host.replace(/\/$/, '')}/api${endpoint}`;
+  const channel = new Channel<{ progress: number; total: number }>();
+  if (onProgress) channel.onmessage = onProgress;
+  const signal = options?.signal;
+  const abortError = () => new DOMException('Upload aborted', 'AbortError');
+  // A unique id per invocation: `cancel_upload` (transfer_file.rs) looks the
+  // in-flight request up by it when the caller's signal aborts.
+  const uploadId = `upload-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  let rejectOnAbort: ((reason?: unknown) => void) | null = null;
+  const onAbort = () => {
+    void invoke('cancel_upload', { uploadId }).catch(() => {});
+    rejectOnAbort?.(abortError());
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    if (signal?.aborted) throw abortError();
+    const invokePromise = invoke<{ status: number; body: string; setCookies: string[] }>(
+      'upload_multipart',
+      {
+        uploadId,
+        url,
+        fields,
+        files,
+        headers: buildMyBooksCookieHeaders(url, { alwaysSession: true }),
+        onProgress: channel,
+      },
+    );
+    // Cancellation may orphan the invoke (Rust unwinds it asynchronously);
+    // keep a no-op handler so it never surfaces as an unhandled rejection.
+    invokePromise.catch(() => {});
+    // Reject promptly on abort rather than waiting for the Rust side to
+    // notice the cancelled body stream.
+    const rsp = await Promise.race([
+      invokePromise,
+      new Promise<never>((_, reject) => {
+        if (signal?.aborted) reject(abortError());
+        else rejectOnAbort = reject;
+      }),
+    ]);
+    const pairs = rsp.setCookies.map((c) => c.split(';', 1)[0]!.trim()).filter(Boolean);
+    if (pairs.length) mergeTauriMyBooksCookie(pairs.join('; '));
+    if (rsp.status < 200 || rsp.status >= 300) {
+      throw new Error(`HTTP ${rsp.status}`);
+    }
+    const result = JSON.parse(rsp.body) as MyBooksResponse<T>;
+    if (result.err !== 'ok') {
+      throw new MyBooksApiError(result.err, result.msg || 'Failed to fetch from MyReader');
+    }
+    return result;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/** A filesystem path (POSIX or Windows drive) or Android content:// URI that Rust can open directly. */
+export const isNativeFsPath = (p: string): boolean => /^(\/|[A-Za-z]:[\\/]|content:\/\/)/.test(p);
 
 /**
  * 检测与 MyBooks 服务器的连接性
@@ -670,7 +843,6 @@ export async function getUserInfo(): Promise<MyBooksUserInfo | null> {
 }
 
 export async function signOut(): Promise<void> {
-  await fetchMyBooks('/user/sign_out', undefined, 'GET');
   if (typeof window !== 'undefined') {
     const remember = localStorage.getItem('mybooks_remember') === 'true';
     if (!remember) {
@@ -678,6 +850,8 @@ export async function signOut(): Promise<void> {
       localStorage.removeItem('mybooks_password');
     }
   }
+  // Best effort and not awaited: an unreachable server must not delay signing out locally.
+  fetchMyBooks('/user/sign_out', undefined, 'GET').catch(() => {});
 }
 
 /**
@@ -916,13 +1090,212 @@ export async function getBookReadingStats(
 }
 
 /**
+ * Like fetchMyBooks, but returns the raw Response so callers can read a
+ * streaming body (SSE). No retry and no JSON parsing — host resolution and
+ * NAS cookie handling are shared with fetchMyBooks.
+ */
+export async function fetchMyBooksStream(
+  endpoint: string,
+  options: {
+    method?: string;
+    body?: BodyInit | null;
+    contentType?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<Response> {
+  const { url, fetchFn, host } = resolveMyBooksRequest(endpoint);
+  const { method = 'GET', body, contentType, signal } = options;
+
+  const fetchOptions: RequestInit = { credentials: 'include', method };
+  if (body) fetchOptions.body = body;
+  if (contentType) fetchOptions.headers = { 'Content-Type': contentType };
+  attachNasCookieHeaders(fetchOptions, url, host);
+  if (signal) fetchOptions.signal = signal;
+
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetchFn(url.toString(), fetchOptions);
+  } catch (error) {
+    console.error(
+      `[fetchMyBooksStream] Request to ${url.toString()} failed:`,
+      error instanceof Error ? error.message : error,
+    );
+    if (host) useMyBooksStatusStore.getState().setOffline(true);
+    throw error;
+  }
+
+  if (host && isTauriAppPlatform()) {
+    try {
+      const cookie = extractCookieHeaderFromResponse(response as unknown as Response);
+      if (cookie) mergeTauriMyBooksCookie(cookie);
+    } catch (e) {
+      console.error('[fetchMyBooksStream] Failed to refresh the Tauri cookie store:', e);
+    }
+  }
+  if (DEBUG_REQUEST_TIMING) {
+    const cost = (performance.now() - startedAt).toFixed(2);
+    console.log(
+      `[MyBooks][${logTime()}][${response.status}][${cost}ms][${method}][${url.pathname}${url.search}]`,
+    );
+  }
+
+  if (!response.ok) {
+    if (host) useMyBooksStatusStore.getState().setOffline(false);
+    let err = `http.${response.status}`;
+    let message: string | undefined;
+    try {
+      const data = (await response.json()) as { err?: string; msg?: string };
+      if (data?.err) err = data.err;
+      message = data?.msg;
+    } catch {
+      // Response body wasn't JSON (e.g. an upstream error page).
+    }
+    throw new MyBooksApiError(err, message || 'Failed to fetch from MyReader');
+  }
+  if (host) useMyBooksStatusStore.getState().setOffline(false);
+  return response;
+}
+
+/**
+ * Whether MyBooks' MyNexus AI companion is usable for this book.
+ * 参见 document/MyBooks_WebAPI.md 3.50 MyNexus AI 伴读
+ */
+export async function getMyNexusAvailability(
+  bookId: number,
+): Promise<{ available: boolean; readingGuide: string }> {
+  const response = await fetchMyBooks<{ available: boolean; reading_guide: string }>(
+    `/book/${bookId}/mynexus/availability`,
+  );
+  return { available: response.available === true, readingGuide: response.reading_guide || '' };
+}
+
+/**
+ * Loads the logged-in user's existing MyNexus session for a book.
+ * Returns an empty message list when no conversation exists yet.
+ */
+export async function getMyNexusSession(bookId: number): Promise<{
+  sessionId: string | null;
+  messages: MyNexusChatMessage[];
+}> {
+  const response = await fetchMyBooks<{
+    session_id: string | null;
+    messages: MyNexusChatMessage[];
+  }>(`/book/${bookId}/mynexus/session`);
+  return {
+    sessionId: response.session_id ?? null,
+    messages: (response.messages || []).map((m) => {
+      const frame = (m.tool_results || []).find((t) => t.tool_name === 'generate_mindmap');
+      return {
+        role: m.role,
+        content: m.content,
+        citations: m.citations,
+        context: m.context,
+        toolResult: frame
+          ? { toolName: frame.tool_name, resultJson: frame.result_json }
+          : undefined,
+      };
+    }),
+  };
+}
+
+/**
+ * Streams a MyNexus chat answer over SSE from MyBooks' `/mynexus/chat`.
+ * Frames are OpenAI-compatible: `choices[0].delta.content` / `citations`,
+ * terminated by `[DONE]`, with `{"error": "..."}` for failures.
+ */
+export async function streamMyNexusChat(
+  bookId: number,
+  messages: MyNexusChatMessage[],
+  callbacks: {
+    onDelta?: (delta: string) => void;
+    onCitations?: (citations: { content: string }[]) => void;
+    onToolResult?: (tool: { toolName: string; resultJson: string }) => void;
+    onDone?: () => void;
+    signal?: AbortSignal;
+  } = {},
+): Promise<void> {
+  console.log(`[MyNexus] chat stream start book=${bookId} messages=${messages.length}`);
+  const response = await fetchMyBooksStream(`/book/${bookId}/mynexus/chat`, {
+    method: 'POST',
+    body: JSON.stringify({
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.context ? { context: m.context } : {}),
+      })),
+    }),
+    contentType: 'application/json',
+    signal: callbacks.signal,
+  });
+  if (!response.body) {
+    throw new Error('MyNexus chat stream is unavailable');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let receivedFirstChunk = false;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!receivedFirstChunk) {
+      receivedFirstChunk = true;
+      console.log('[MyNexus] chat stream first chunk received');
+    }
+    buffer += decoder.decode(value || new Uint8Array(), { stream: true });
+    buffer = buffer.replace(/\r\n/g, '\n');
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const payload = frame
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim())
+        .join('\n');
+      if (payload && payload !== '[DONE]') {
+        const event = JSON.parse(payload) as {
+          error?: string;
+          choices?: { delta?: { content?: string } }[];
+          citations?: { content: string }[];
+          tool_result?: { tool_name?: string; result_json?: string };
+        };
+        if (event.error) throw new Error(event.error);
+        const delta = event.choices?.[0]?.delta?.content;
+        if (delta) callbacks.onDelta?.(delta);
+        if (event.citations) callbacks.onCitations?.(event.citations);
+        if (event.tool_result?.tool_name) {
+          callbacks.onToolResult?.({
+            toolName: event.tool_result.tool_name,
+            resultJson: event.tool_result.result_json ?? '',
+          });
+        }
+      }
+      boundary = buffer.indexOf('\n\n');
+    }
+  }
+
+  console.log('[MyNexus] chat stream done');
+  callbacks.onDone?.();
+}
+
+/**
  * 上传图书文件
  * 参见 document/MyBooks_WebAPI.md 3.47 上传图书：POST /api/book/upload，字段名 ebook
  */
 export async function uploadBookToMyBooks(file: Blob, filename: string): Promise<number> {
   const formData = new FormData();
   formData.append('ebook', file, filename);
-  const response = await fetchMyBooks('/book/upload', undefined, 'POST', formData);
+  const response = await fetchMyBooks(
+    '/book/upload',
+    undefined,
+    'POST',
+    formData,
+    undefined,
+    MYBOOKS_UPLOAD_TIMEOUT_MS,
+  );
   return response.book_id ?? 0;
 }
 

@@ -32,6 +32,8 @@ mod nightly_update;
 mod parser_common;
 mod range_file;
 mod sentry_config;
+#[cfg(any(target_os = "android", test))]
+mod shared_log_dir;
 #[cfg(desktop)]
 mod spawn_fresh_browser;
 mod transfer_file;
@@ -47,7 +49,7 @@ use tauri_plugin_native_bridge::{NativeBridgeExt, OpenExternalUrlRequest};
 use tauri_plugin_oauth::start;
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
-use transfer_file::{download_file, upload_file};
+use transfer_file::{cancel_upload, download_file, upload_file, upload_multipart};
 
 #[cfg(any(desktop, target_os = "ios"))]
 fn allow_file_in_scopes(app: &AppHandle, files: Vec<PathBuf>) {
@@ -406,14 +408,25 @@ pub fn run() {
         ))
     });
 
-    // Writing logs to shared storage (e.g. Download) would need
-    // `MANAGE_EXTERNAL_STORAGE`, which has no ordinary runtime prompt — only
-    // a Settings-screen redirect (see `request_manage_storage_permission` in
-    // the native-bridge plugin, used for the custom library folder feature)
-    // — and log-target selection happens at startup, before the app has any
-    // UI to drive that redirect from. Attempting the write anyway without
-    // that permission silently fails with `EACCES` on many OEM skins
-    // (observed on MIUI), so logs always go to the private per-app dir.
+    // On Android, prefer `Download/MyReader/myreader.log` so users can find
+    // the log without digging through the private sandbox. No permission
+    // prompt is involved: Android 11+ lets an app write its own files under
+    // `Download/`, and "All files access" (if already granted for the custom
+    // library folder feature) covers the rest. The probe opens the exact log
+    // file, so anything the log plugin can't open (e.g. a file left by a
+    // previous install, which fails with `EACCES`) falls back to the private
+    // per-app log dir instead of aborting startup. Decided once per launch.
+    #[cfg(target_os = "android")]
+    let log_target = match shared_log_dir::writable_shared_log_dir() {
+        Some(path) => tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+            path,
+            file_name: Some(shared_log_dir::LOG_FILE_STEM.into()),
+        }),
+        None => {
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None })
+        }
+    };
+    #[cfg(not(target_os = "android"))]
     let log_target =
         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None });
 
@@ -436,6 +449,8 @@ pub fn run() {
             start_server,
             download_file,
             upload_file,
+            upload_multipart,
+            cancel_upload,
             get_environment_variable,
             get_executable_dir,
             set_webview_info,

@@ -18,8 +18,12 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use read_progress_stream::ReadProgressStream;
 
-use std::time::Instant;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const DEBUG_DOWNLOAD_TIMING: bool = true;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -188,6 +192,7 @@ pub async fn download_file(
     use tokio::io::AsyncSeekExt;
 
     ensure_path_allowed(&app, file_path)?;
+    let download_started = Instant::now();
 
     const PART_SIZE: u64 = 1024 * 1024;
 
@@ -198,6 +203,7 @@ pub async fn download_file(
     let force_single = single_threaded.unwrap_or(false);
 
     async fn single_threaded_download(
+        download_started: Instant,
         client: &reqwest::Client,
         url: &str,
         file_path: &str,
@@ -246,12 +252,19 @@ pub async fn download_file(
             });
         }
         file.flush().await?;
+        if DEBUG_DOWNLOAD_TIMING {
+            log::info!(
+                "[download][single][{}B][{:.2}ms]",
+                stats.total_transferred,
+                download_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok(resp_headers)
     }
 
     if force_single {
-        return single_threaded_download(&client, url, file_path, &headers, &body, on_progress)
+        return single_threaded_download(download_started, &client, url, file_path, &headers, &body, on_progress)
             .await;
     }
 
@@ -286,7 +299,7 @@ pub async fn download_file(
     }
 
     if !accept_ranges || total == 0 {
-        return single_threaded_download(&client, url, file_path, &headers, &body, on_progress)
+        return single_threaded_download(download_started, &client, url, file_path, &headers, &body, on_progress)
             .await;
     }
 
@@ -297,46 +310,77 @@ pub async fn download_file(
 
     let file = Arc::new(tokio::sync::Mutex::new(file));
     let progress = Arc::new(tokio::sync::Mutex::new(TransferStats::default()));
+    let failure: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
 
     stream::iter(0..part_count)
         .for_each_concurrent(8, |i| {
             let client = client.clone();
             let file = Arc::clone(&file);
             let progress = Arc::clone(&progress);
+            let failure = Arc::clone(&failure);
             let headers = headers.clone();
             let url = url.to_string();
             let on_progress = on_progress.clone();
 
             async move {
+                let part_started = Instant::now();
                 let start = i * PART_SIZE;
                 let end = min(start + PART_SIZE - 1, total - 1);
                 let range_header = format!("bytes={start}-{end}");
 
-                let mut req = client.get(&url).header("Range", range_header);
-                for (key, value) in headers {
-                    req = req.header(key, value);
+                // A silently-dropped part would leave a zero-filled hole in the
+                // pre-allocated file (a corrupt book that still "downloads"), so
+                // retry and surface the failure instead.
+                let expected_len = end - start + 1;
+                let mut last_err = String::new();
+                let mut fetched = None;
+                for _ in 0..3 {
+                    let mut req = client.get(&url).header("Range", range_header.as_str());
+                    for (key, value) in headers.iter() {
+                        req = req.header(key, value);
+                    }
+                    match req.send().await {
+                        // A range covering the whole file may get a plain 200.
+                        Ok(resp)
+                            if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                                || (resp.status() == reqwest::StatusCode::OK
+                                    && expected_len == total) =>
+                        {
+                            match resp.bytes().await {
+                                Ok(b) if b.len() as u64 == expected_len => {
+                                    fetched = Some(b);
+                                    break;
+                                }
+                                Ok(b) => last_err = format!("short part: {} bytes", b.len()),
+                                Err(e) => last_err = e.to_string(),
+                            }
+                        }
+                        Ok(resp) => last_err = format!("status {}", resp.status()),
+                        Err(e) => last_err = e.to_string(),
+                    }
                 }
-
-                let resp = match req.send().await {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-
-                if !resp.status().is_success()
-                    && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT
-                {
+                let Some(bytes) = fetched else {
+                    failure
+                        .lock()
+                        .await
+                        .get_or_insert(format!("part {i} failed: {last_err}"));
                     return;
-                }
-
-                let bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(_) => return,
                 };
 
                 {
                     let mut f = file.lock().await;
                     f.seek(std::io::SeekFrom::Start(start)).await.unwrap();
                     f.write_all(&bytes).await.unwrap();
+                }
+
+                if DEBUG_DOWNLOAD_TIMING {
+                    log::info!(
+                        "[part][{}/{}][{}][{:.2}ms]",
+                        i + 1,
+                        part_count,
+                        range_header,
+                        part_started.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
 
                 {
@@ -351,6 +395,19 @@ pub async fn download_file(
             }
         })
         .await;
+
+    if let Some(msg) = failure.lock().await.take() {
+        drop(file);
+        let _ = tokio::fs::remove_file(file_path).await;
+        return Err(Error::UnexpectedResponse(msg));
+    }
+
+    if DEBUG_DOWNLOAD_TIMING {
+        log::info!(
+            "[download][{part_count} parts][{total}B][{:.2}ms]",
+            download_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     Ok(resp_headers)
 }
@@ -392,6 +449,165 @@ pub async fn upload_file(
             response.status().as_u16(),
             response.text().await.unwrap_or_default(),
         ))
+    }
+}
+
+/// Opens a file for upload. Android `content://` URIs (what the file picker hands
+/// back) can't go through `File::open`; the fs plugin resolves them to a file
+/// descriptor via the ContentResolver, so the bytes still never enter the webview.
+/// Access to such a URI is enforced by Android itself, so no path scope check applies.
+async fn open_upload_file(app: &AppHandle, file_path: &str) -> Result<File> {
+    if file_path.starts_with("content://") {
+        let url = tauri::Url::parse(file_path)
+            .map_err(|e| Error::UnexpectedResponse(format!("invalid content uri: {e}")))?;
+        let opts = tauri_plugin_fs::OpenOptions::new().read(true).clone();
+        let file = app.fs().open(tauri_plugin_fs::FilePath::Url(url), opts)?;
+        return Ok(File::from_std(file));
+    }
+    ensure_path_allowed(app, file_path)?;
+    Ok(File::open(file_path).await?)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadPart {
+    field: String,
+    file_path: String,
+    file_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadResponse {
+    status: u16,
+    body: String,
+    /// Raw `Set-Cookie` values, so JS can merge a rotated session back into its cookie store.
+    set_cookies: Vec<String>,
+}
+
+/// Upload-cancellation registry: `upload_id` -> flag checked between body
+/// chunks. `cancel_upload` flips the flag and drops the entry; the multipart
+/// body stream then ends early at the next chunk, which breaks the length
+/// promise of `Part::stream_with_length` and fails the request.
+fn upload_cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Signals an in-flight `upload_multipart` to stop. Returns false when no
+/// upload with that id is running (already finished, or cancelled before it
+/// had a chance to register).
+#[command]
+pub fn cancel_upload(upload_id: String) -> bool {
+    if let Some(flag) = upload_cancels().lock().unwrap().remove(&upload_id) {
+        flag.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Multipart upload streamed from disk. File bytes never cross the JS<->Rust
+/// boundary, and the request carries only the caller-supplied headers (the
+/// `Cookie` header must be passed explicitly: reqwest here has no cookie jar).
+/// `upload_id` names the upload in the cancellation registry (see
+/// `cancel_upload`); callers pass a fresh unique id per invocation.
+#[command]
+pub async fn upload_multipart(
+    app: AppHandle,
+    upload_id: &str,
+    url: &str,
+    fields: Vec<(String, String)>,
+    files: Vec<UploadPart>,
+    headers: HashMap<String, String>,
+    on_progress: Channel<ProgressPayload>,
+) -> Result<UploadResponse> {
+    let mut opened = Vec::with_capacity(files.len());
+    let mut total = 0u64;
+    for part in &files {
+        let file = open_upload_file(&app, &part.file_path).await?;
+        let len = file.metadata().await?.len();
+        total += len;
+        opened.push((file, len));
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    upload_cancels()
+        .lock()
+        .unwrap()
+        .insert(upload_id.to_string(), Arc::clone(&cancelled));
+
+    let stats = Arc::new(std::sync::Mutex::new(TransferStats::default()));
+    let mut form = reqwest::multipart::Form::new();
+    for (name, value) in fields {
+        form = form.text(name, value);
+    }
+    for (part, (file, len)) in files.into_iter().zip(opened) {
+        let stream = FramedRead::new(file, BytesCodec::new())
+            .map_ok(|r| r.freeze())
+            .try_take_while({
+                let cancelled = Arc::clone(&cancelled);
+                move |_| std::future::ready(Ok(!cancelled.load(Ordering::Relaxed)))
+            });
+        let stats = Arc::clone(&stats);
+        let channel = on_progress.clone();
+        let body = reqwest::Body::wrap_stream(ReadProgressStream::new(
+            stream,
+            Box::new(move |chunk, _| {
+                let mut s = stats.lock().unwrap();
+                s.record_chunk_transfer(chunk as usize);
+                let _ = channel.send(ProgressPayload {
+                    progress: s.total_transferred,
+                    total,
+                    transfer_speed: s.transfer_speed,
+                });
+            }),
+        ));
+        form = form.part(
+            part.field,
+            reqwest::multipart::Part::stream_with_length(body, len).file_name(part.file_name),
+        );
+    }
+
+    // A connect timeout keeps a dead server from pinning the upload slot
+    // forever; the body itself is only bounded by the cancellation registry.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
+    let mut request = client.post(url).multipart(form);
+    for (key, value) in headers {
+        request = request.header(&key, value);
+    }
+
+    let response = request.send().await;
+    upload_cancels().lock().unwrap().remove(upload_id);
+    let response = response?;
+    let status = response.status().as_u16();
+    let set_cookies = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+    let body = response.text().await?;
+    Ok(UploadResponse { status, body, set_cookies })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_upload_only_signals_registered_id() {
+        let flag = Arc::new(AtomicBool::new(false));
+        upload_cancels()
+            .lock()
+            .unwrap()
+            .insert("test-upload".to_string(), Arc::clone(&flag));
+        assert!(cancel_upload("test-upload".to_string()));
+        assert!(flag.load(Ordering::Relaxed));
+        // Already removed by the first cancel: not signalled again.
+        assert!(!cancel_upload("test-upload".to_string()));
+        assert!(!cancel_upload("unknown-upload".to_string()));
     }
 }
 

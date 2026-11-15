@@ -1,5 +1,6 @@
 'use client';
 
+import { logTime } from '@/utils/misc';
 import clsx from 'clsx';
 import * as React from 'react';
 import { MdChevronRight } from 'react-icons/md';
@@ -117,6 +118,7 @@ import ModalPortal from '@/components/ModalPortal';
 import ErrorMessageDialog from '@/components/ErrorMessageDialog';
 import TransferQueuePanel from './components/TransferQueuePanel';
 import LibraryDrawer from './components/LibraryDrawer';
+import UploadFab from './components/UploadFab';
 // MyBooks API imports
 import { getBooksByType, searchBooks } from '@/services/mybooksService';
 import { convertMyBooksToLocalBooks, resolveCloudBooksPageAppend } from '@/utils/bookConverter';
@@ -164,6 +166,7 @@ const LAST_IMPORT_FOLDER_READ_IN_PLACE_KEY = 'readest:lastImportFolderReadInPlac
  * click).
  */
 const CLOUD_BOOKS_PAGE_SIZE = 20;
+const DEBUG_DOWNLOAD_TIMING = true;
 
 const LibraryPageWithSearchParams = () => {
   const searchParams = useSearchParams();
@@ -1218,9 +1221,14 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
             'hash:',
             book.hash,
           );
+          const downloadStartedAt = performance.now();
           await appService?.downloadBook(book, false, redownload, (progress) => {
             updateBookTransferProgress(book.hash, progress);
           });
+          if (DEBUG_DOWNLOAD_TIMING) {
+            const cost = (performance.now() - downloadStartedAt).toFixed(2);
+            console.log(`[${logTime()}][handleBookDownload][${book.hash}][${cost}ms]`);
+          }
           console.log(
             '[handleBookDownload] downloadBook finished. book state after download:',
             book,
@@ -2106,6 +2114,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
               </div>
             </div>
           )}
+          {!!user && isAdmin && !isSelectMode && <UploadFab />}
           <NowPlayingBar isSelectMode={isSelectMode} />
           <AudiobookMiniBar isSelectMode={isSelectMode} />
           <AudiobookPlayerSheet />

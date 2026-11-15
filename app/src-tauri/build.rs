@@ -29,6 +29,8 @@ fn main() {
             "start_server",
             "download_file",
             "upload_file",
+            "upload_multipart",
+            "cancel_upload",
             "get_environment_variable",
             "get_executable_dir",
             "set_webview_info",

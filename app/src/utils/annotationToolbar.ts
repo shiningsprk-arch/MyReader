@@ -6,6 +6,7 @@ export const ALL_ANNOTATION_TOOL_TYPES: AnnotationToolType[] = [
   'copy',
   'highlight',
   'annotate',
+  'ai-chat',
   'search',
   'dictionary',
   'translate',
@@ -14,9 +15,21 @@ export const ALL_ANNOTATION_TOOL_TYPES: AnnotationToolType[] = [
   'share',
 ];
 
-// Default toolbar: the eight pre-existing tools in their original order.
+// Default toolbar: all nine non-share tools in canonical order.
 // 'share' starts hidden in the Available tray per the #4014 design.
 export const DEFAULT_ANNOTATION_TOOLBAR_ITEMS: AnnotationToolType[] = [
+  'copy',
+  'highlight',
+  'annotate',
+  'ai-chat',
+  'search',
+  'dictionary',
+  'translate',
+  'tts',
+  'proofread',
+];
+
+const LEGACY_DEFAULT_ANNOTATION_TOOLBAR_ITEMS: AnnotationToolType[] = [
   'copy',
   'highlight',
   'annotate',
@@ -26,6 +39,14 @@ export const DEFAULT_ANNOTATION_TOOLBAR_ITEMS: AnnotationToolType[] = [
   'tts',
   'proofread',
 ];
+
+export const migrateLegacyDefaultAnnotationToolbarItems = (
+  items: AnnotationToolType[] | undefined,
+): AnnotationToolType[] | undefined =>
+  items?.length === LEGACY_DEFAULT_ANNOTATION_TOOLBAR_ITEMS.length &&
+  items.every((type, index) => type === LEGACY_DEFAULT_ANNOTATION_TOOLBAR_ITEMS[index])
+    ? [...DEFAULT_ANNOTATION_TOOLBAR_ITEMS]
+    : items;
 
 // Drop unknown/duplicate entries; fall back to the default when unset (a
 // pre-existing per-book config may not carry the field yet).
@@ -46,16 +67,22 @@ const sanitize = (items: AnnotationToolType[] | undefined): AnnotationToolType[]
 export const getToolbarToolTypes = (
   items: AnnotationToolType[] | undefined,
   canShare: boolean,
-): AnnotationToolType[] => sanitize(items).filter((type) => canShare || type !== 'share');
+  canUseAi = true,
+): AnnotationToolType[] =>
+  sanitize(items).filter(
+    (type) => (canShare || type !== 'share') && (canUseAi || type !== 'ai-chat'),
+  );
 
 // Hidden tools (the "Available" tray), in canonical order.
 export const getAvailableToolTypes = (
   items: AnnotationToolType[] | undefined,
   canShare: boolean,
+  canUseAi = true,
 ): AnnotationToolType[] => {
   const visible = new Set(sanitize(items));
   return ALL_ANNOTATION_TOOL_TYPES.filter(
-    (type) => !visible.has(type) && (canShare || type !== 'share'),
+    (type) =>
+      !visible.has(type) && (canShare || type !== 'share') && (canUseAi || type !== 'ai-chat'),
   );
 };
 

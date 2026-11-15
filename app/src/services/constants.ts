@@ -104,6 +104,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   keepLogin: true,
   autoUpload: false,
   autoSetReadState: true,
+  autoRetryTransfers: false,
   allowDelCloudBook: true,
   autoSyncReadingBooks: false,
   alwaysOnTop: false,
@@ -469,7 +470,7 @@ export const DEFAULT_VIEW_SETTINGS_CONFIG: ViewSettingsConfig = {
   isGlobal: true,
 };
 
-export const SYSTEM_SETTINGS_VERSION = 1;
+export const SYSTEM_SETTINGS_VERSION = 2;
 
 export const SERIF_FONTS = [
   'Bitter',

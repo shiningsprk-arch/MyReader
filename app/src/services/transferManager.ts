@@ -1,12 +1,19 @@
 import { Book } from '@/types/book';
 import { AppService } from '@/types/system';
-import { useTransferStore, TransferItem } from '@/store/transferStore';
+import { useTransferStore, TransferItem, isInterruptedTransfer } from '@/store/transferStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { TranslationFunc } from '@/hooks/useTranslation';
 import { createProgressThrottle, ProgressPayload } from '@/utils/transfer';
 import { eventDispatcher } from '@/utils/event';
 import { getTransferMessages } from './transferMessages';
-import { MyBooksApiError } from './mybooksService';
+import {
+  MyBooksApiError,
+  fetchMyBooks,
+  isNativeFsPath,
+  MYBOOKS_UPLOAD_TIMEOUT_MS,
+  uploadMyBooksFilesNative,
+} from './mybooksService';
+import { isTauriAppPlatform } from './environment';
 import { downloadMyBooksUrl } from './cloudService';
 import { resolveAudioTrackUrl, type AudioTrack } from './audiobook/audiobookService';
 import {
@@ -32,6 +39,10 @@ const QUOTA_TOAST_FLUSH_MS = 1500;
 // more expensive. Cap what gets written to the most recently completed N —
 // the in-memory store (and thus the UI history list) is untouched.
 const MAX_PERSISTED_COMPLETED = 50;
+const MAX_CONCURRENT_UPLOADS = 1;
+// Fallback uploads buffer the whole file in the webview; past this size that gets the
+// app killed (OOM) on mobile, so refuse instead.
+const MAX_IN_MEMORY_UPLOAD_BYTES = 32 * 1024 * 1024;
 
 interface PersistedQueueData {
   schemaVersion?: number;
@@ -73,6 +84,11 @@ class TransferManager {
   private updateBook: ((book: Book) => Promise<void>) | null = null;
   private _: TranslationFunc | null = null;
   private settingsUnsub: (() => void) | null = null;
+  // Web File objects can't be persisted, so they wait here keyed by dedup key.
+  private pendingWebFiles: Map<string, File> = new Map();
+  // Interrupted rows restored before settings hydrated, whose resume decision
+  // (autoRetryTransfers) couldn't be read yet; see applyDeferredResume().
+  private deferredResumeIds: string[] = [];
   private quotaFailureCount = 0;
   private quotaToastTimer: ReturnType<typeof setTimeout> | null = null;
   private readyResolve: () => void = () => {};
@@ -156,9 +172,13 @@ class TransferManager {
     this.settingsUnsub?.();
     this.settingsUnsub = useSettingsStore.subscribe((state, prev) => {
       if (state.settings === prev.settings) return;
+      this.applyDeferredResume();
       this.reconcileUploadsWithProvider();
       this.processQueue();
     });
+    // Settings may have hydrated between loadPersistedQueue and the
+    // subscription above; the deferred resume decision must not miss it.
+    this.applyDeferredResume();
 
     // Start processing queue
     this.processQueue();
@@ -203,6 +223,31 @@ class TransferManager {
     this.persistQueue();
     this.processQueue();
     return transferId;
+  }
+
+  /**
+   * Queues local files (not in the library) for upload to MyBooks, one transfer
+   * per file. Identity is `file:<path|name+size>` so re-picking a file that is
+   * still queued/uploading is a no-op.
+   */
+  queueFileUploads(files: Array<{ path?: string; file?: File; name: string }>): string[] {
+    if (!this.isReady()) {
+      console.warn('TransferManager not initialized');
+      return [];
+    }
+    const store = useTransferStore.getState();
+    const items: Array<{ key: string; filePath?: string; fileName: string }> = [];
+    for (const f of files) {
+      const key = `file:${f.path ?? `${f.name}:${f.file?.size ?? 0}`}`;
+      if (store.getTransferByBookHash(key, 'upload')) continue;
+      if (f.file) this.pendingWebFiles.set(key, f.file);
+      items.push({ key, filePath: f.path, fileName: f.name });
+    }
+    if (items.length === 0) return [];
+    const ids = store.addFileUploadTransfers(items);
+    this.persistQueue();
+    this.processQueue();
+    return ids;
   }
 
   queueDownload(book: Book, priority: number = 10): string | null {
@@ -416,7 +461,17 @@ class TransferManager {
       return a.createdAt - b.createdAt;
     });
 
-    const toProcess = sortedPending.slice(0, availableSlots);
+    let activeUploads = store.getActiveTransfers().filter((t) => t.type === 'upload').length;
+    const toProcess: TransferItem[] = [];
+    for (const t of sortedPending) {
+      if (toProcess.length >= availableSlots) break;
+      if (t.type === 'upload') {
+        if (activeUploads >= MAX_CONCURRENT_UPLOADS) continue;
+        activeUploads++;
+      }
+      toProcess.push(t);
+    }
+    if (toProcess.length === 0) return;
 
     await Promise.all(toProcess.map((transfer) => this.executeTransfer(transfer)));
 
@@ -443,6 +498,8 @@ class TransferManager {
 
     store.setTransferStatus(transfer.id, 'in_progress');
     store.setActiveCount(store.getActiveTransfers().length + 1);
+    // Persist the in-flight state so a kill mid-upload is restored as interrupted, not re-run.
+    if (transfer.kind === 'file_upload') this.persistQueue();
 
     const progressThrottle = createProgressThrottle((progress) => {
       const percentage = progress.total > 0 ? (progress.progress / progress.total) * 100 : 0;
@@ -465,8 +522,17 @@ class TransferManager {
     try {
       if (transfer.kind === 'audiobook_track') {
         await this.executeAudiobookTrackTransfer(transfer, progressHandler);
+      } else if (transfer.kind === 'file_upload') {
+        await this.executeFileUpload(transfer, progressHandler, abortController);
       } else {
         await this.executeBookTransfer(transfer, progressHandler, abortController);
+      }
+
+      // Uploads don't throw on abort (the native invoke may still land), so an
+      // already-cancelled transfer must not be re-marked completed here.
+      if (abortController.signal.aborted) {
+        // Already cancelled, don't update status
+        return;
       }
 
       // Land the final progress value that the throttle may still be holding.
@@ -502,6 +568,7 @@ class TransferManager {
       const isQuotaError = errorMessage.includes('Insufficient storage quota');
 
       if (
+        useSettingsStore.getState().settings.autoRetryTransfers === true &&
         !isQuotaError &&
         currentTransfer &&
         currentTransfer.retryCount < currentTransfer.maxRetries
@@ -633,6 +700,58 @@ class TransferManager {
     await downloadMyBooksUrl(appService, resolvedUrl, dst, progressHandler);
   }
 
+  /**
+   * Uploads one picked file to MyBooks. Plain filesystem paths are streamed by
+   * Rust (bytes never enter the webview); content:// URIs and web Files can't
+   * be read there and fall back to an in-memory FormData upload. The caller's
+   * abort signal stops both paths: the native one via the Rust cancellation
+   * registry, the in-memory one via the fetch signal.
+   */
+  private async executeFileUpload(
+    transfer: TransferItem,
+    progressHandler: (p: ProgressPayload) => void,
+    abortController: AbortController,
+  ): Promise<void> {
+    const payload = transfer.fileUpload;
+    if (!payload) throw new Error('Missing file upload payload');
+    const { filePath, fileName } = payload;
+
+    let rsp: { err: string; msg?: string };
+    if (isTauriAppPlatform() && filePath && isNativeFsPath(filePath)) {
+      rsp = await uploadMyBooksFilesNative<unknown>(
+        '/book/upload',
+        [{ field: 'ebook', filePath, fileName }],
+        [],
+        ({ progress, total }) => progressHandler({ progress, total, transferSpeed: 0 }),
+        { signal: abortController.signal },
+      );
+    } else {
+      let file = this.pendingWebFiles.get(transfer.bookHash);
+      if (!file && filePath) {
+        const nf = await this.appService!.openFile(filePath, 'None');
+        if (nf.size > MAX_IN_MEMORY_UPLOAD_BYTES)
+          throw new Error(this._!('File is too large to upload'));
+        file = new File([await nf.arrayBuffer()], fileName, { type: nf.type });
+      }
+      if (!file) throw new Error(this._!('File is no longer available'));
+      if (file.size > MAX_IN_MEMORY_UPLOAD_BYTES)
+        throw new Error(this._!('File is too large to upload'));
+      const data = new FormData();
+      data.append('ebook', file, fileName);
+      rsp = await fetchMyBooks<unknown>(
+        '/book/upload',
+        undefined,
+        'POST',
+        data,
+        undefined,
+        MYBOOKS_UPLOAD_TIMEOUT_MS,
+        abortController.signal,
+      );
+    }
+    if (rsp.err !== 'ok') throw new MyBooksApiError(rsp.err, rsp.msg);
+    this.pendingWebFiles.delete(transfer.bookHash);
+  }
+
   private async loadPersistedQueue(): Promise<void> {
     try {
       if (typeof localStorage === 'undefined') return;
@@ -645,10 +764,51 @@ class TransferManager {
 
       // Restore all transfers using the store's restore method
       // This preserves the original IDs and handles in_progress -> pending conversion
-      store.restoreTransfers(data.transfers, data.isQueuePaused);
+      //
+      // The resume decision needs the persisted autoRetryTransfers setting,
+      // but initialize can run before settings hydrate (settings are always
+      // `{}` then, so the default would read as false). When that's the case,
+      // restore conservatively (no resume) and remember which interrupted
+      // rows the decision applies to; applyDeferredResume() re-decides once
+      // settings actually arrive.
+      const settings = useSettingsStore.getState().settings;
+      if (!this.isSettingsLoaded()) {
+        this.deferredResumeIds = Object.values(data.transfers)
+          .filter((t) => isInterruptedTransfer({ ...t, kind: t.kind ?? 'book' }))
+          .map((t) => t.id);
+      }
+      const resume = settings.autoRetryTransfers === true;
+      store.restoreTransfers(data.transfers, data.isQueuePaused, resume);
     } catch (error) {
       console.error('Failed to load transfer queue:', error);
     }
+  }
+
+  /**
+   * Applies the resume half of `autoRetryTransfers` once settings are
+   * actually loaded. Rows restored while settings were still empty sit as
+   * failed/'Interrupted'; with the setting on they are revived to pending
+   * exactly as if the setting had been readable at restore time. With it
+   * off they stay failed for the user to retry by hand.
+   */
+  private applyDeferredResume(): void {
+    if (this.deferredResumeIds.length === 0) return;
+    const settings = useSettingsStore.getState().settings;
+    if (!this.isSettingsLoaded()) return;
+    const ids = this.deferredResumeIds;
+    this.deferredResumeIds = [];
+    if (settings.autoRetryTransfers !== true) return;
+
+    const store = useTransferStore.getState();
+    let revived = 0;
+    ids.forEach((id) => {
+      const transfer = store.transfers[id];
+      if (transfer && transfer.status === 'failed' && transfer.error === 'Interrupted') {
+        store.retryTransfer(id);
+        revived++;
+      }
+    });
+    if (revived > 0) this.persistQueue();
   }
 
   private persistQueue(): void {

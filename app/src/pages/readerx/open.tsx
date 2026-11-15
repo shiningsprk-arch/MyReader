@@ -19,6 +19,7 @@ interface WhoamiResponse {
   username?: string;
   canRead?: boolean;
   isActive?: boolean;
+  is_guest?: boolean;
 }
 
 // Resolves the MyBooks origin the user actually used to get here, without
@@ -58,7 +59,7 @@ const ReaderEmbedOpen = () => {
   const _ = useTranslation();
   const router = useRouter();
   const appRouter = useAppRouter();
-  const { login } = useAuth();
+  const { login, loginAsGuest } = useAuth();
   const { appService } = useEnv();
   const [error, setError] = useState<string | null>(null);
   const started = useRef(false);
@@ -75,6 +76,9 @@ const ReaderEmbedOpen = () => {
     const cfi = (
       Array.isArray(router.query['cfi']) ? router.query['cfi'][0] : router.query['cfi']
     ) as string | undefined;
+    const title = (
+      Array.isArray(router.query['title']) ? router.query['title'][0] : router.query['title']
+    ) as string | undefined;
     const returnUrl =
       ((Array.isArray(router.query['returnUrl'])
         ? router.query['returnUrl'][0]
@@ -89,27 +93,38 @@ const ReaderEmbedOpen = () => {
       try {
         const whoamiResponse = await fetch('/api/mybooks/whoami', { credentials: 'include' });
         const identity: WhoamiResponse = whoamiResponse.ok ? await whoamiResponse.json() : {};
-        if (!identity.userId || !identity.canRead || !identity.isActive) {
+        if (!identity.canRead || !identity.isActive || (!identity.userId && !identity.is_guest)) {
           setError(_('Please sign in to MyBooks first'));
           return;
         }
 
         const host = resolveMyBooksOrigin(returnUrl);
-        const sessionToken = btoa(`mybooks:${identity.userId}:${Date.now()}`);
-        const mockUser = {
-          id: String(identity.userId),
-          email: `${identity.username || identity.userId}@mybooks.local`,
-          app_metadata: {},
-          user_metadata: {},
-          aud: '',
-          role: '',
-          confirmed_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        } as unknown as User;
-        login(sessionToken, mockUser, host);
+        if (identity.is_guest) {
+          // Share-link visitor: MyBooks' whoami returned a guest identity because
+          // the browser carries a valid `share_grants` cookie, so there is no
+          // account to log into. Enter MyReader's existing guest mode instead of
+          // forging a `user_<id>` session — that keeps account-bound features
+          // (notably `/api/sync`, gated on `!isGuest` in useNativeSync) turned
+          // off for a read-only share, matching the rest of MyReader's guest
+          // handling. See document/MyReader_Embedded_WebApp.md §5.
+          loginAsGuest(host);
+        } else {
+          const sessionToken = btoa(`mybooks:${identity.userId}:${Date.now()}`);
+          const mockUser = {
+            id: String(identity.userId),
+            email: `${identity.username || identity.userId}@mybooks.local`,
+            app_metadata: {},
+            user_metadata: {},
+            aud: '',
+            role: '',
+            confirmed_at: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          } as unknown as User;
+          login(sessionToken, mockUser, host);
+        }
 
-        const book = await ensureMyBooksBookLocal({ bookId, format, appService });
+        const book = await ensureMyBooksBookLocal({ bookId, format, title, appService });
         setEmbedReturnUrl(book.hash, returnUrl);
 
         const queryParams = cfi ? `cfi=${encodeURIComponent(cfi)}` : undefined;
