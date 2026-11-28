@@ -258,6 +258,54 @@ describe('bookDataStore', () => {
       expect(result).toBeUndefined();
     });
 
+    test('keeps a drawing that a stale caller list omits', () => {
+      const ink = makeBookNote({
+        id: 'ink1',
+        type: 'ink',
+        cfi: 'epubcfi(/6/10)',
+        note: '',
+        updatedAt: 2000,
+        ink: [{ id: 's1', color: '#000', width: 0.004, points: [[0.1, 0.1]] }],
+      });
+      const data = makeBookData('book1', { booknotes: [ink] });
+      useBookDataStore.setState({ booksData: { book1: data } });
+
+      // A handler that rendered before the drawing was committed writes its
+      // list back: the drawing must survive.
+      useBookDataStore
+        .getState()
+        .updateBooknotes('book1', [makeBookNote({ id: 'h1', cfi: 'epubcfi(/6/12)' })]);
+
+      const ids = useBookDataStore
+        .getState()
+        .getConfig('book1')!
+        .booknotes!.map((n) => n.id);
+      expect(ids).toContain('ink1');
+      expect(ids).toContain('h1');
+    });
+
+    test('keeps the newer drawing when a stale caller passes an older revision', () => {
+      const ink = makeBookNote({
+        id: 'ink1',
+        type: 'ink',
+        cfi: 'epubcfi(/6/10)',
+        note: '',
+        updatedAt: 3000,
+        ink: [{ id: 's2', color: '#000', width: 0.004, points: [[0.2, 0.2]] }],
+      });
+      const data = makeBookData('book1', { booknotes: [ink] });
+      useBookDataStore.setState({ booksData: { book1: data } });
+
+      useBookDataStore.getState().updateBooknotes('book1', [{ ...ink, updatedAt: 1000, ink: [] }]);
+
+      const stored = useBookDataStore
+        .getState()
+        .getConfig('book1')!
+        .booknotes!.find((n) => n.id === 'ink1')!;
+      expect(stored.updatedAt).toBe(3000);
+      expect(stored.ink).toHaveLength(1);
+    });
+
     test('extracts id from "id-suffix" key format', () => {
       const data = makeBookData('book1', { booknotes: [] });
       useBookDataStore.setState({ booksData: { book1: data } });
@@ -475,6 +523,26 @@ describe('bookDataStore', () => {
 
       const persistedConfig = saveBookConfig.mock.calls[0]![1] as BookConfig;
       expect(persistedConfig.updatedAt).toBeGreaterThan(1000);
+    });
+
+    test('preserveUpdatedAt keeps the pulled record timestamp', async () => {
+      const saveBookConfig = vi.fn().mockResolvedValue(undefined);
+      const saveLibraryBooks = vi.fn().mockResolvedValue(undefined);
+      const envConfig = makeEnvConfig({ saveBookConfig, saveLibraryBooks });
+
+      useLibraryStore.getState().setLibrary([makeLibraryBook({ hash: 'h1' })]);
+
+      const data = makeBookData('h1', { progress: [42, 100], updatedAt: 2000 });
+      useBookDataStore.setState({ booksData: { h1: data } });
+
+      await useBookDataStore
+        .getState()
+        .saveConfig(envConfig, 'h1', data.config!, FAKE_SETTINGS, { preserveUpdatedAt: true });
+
+      const persistedConfig = saveBookConfig.mock.calls[0]![1] as BookConfig;
+      expect(persistedConfig.updatedAt).toBe(2000);
+      // Applying a remote position must not make the local record look newer.
+      expect(useBookDataStore.getState().getConfig('h1')!.updatedAt).toBe(2000);
     });
   });
 });

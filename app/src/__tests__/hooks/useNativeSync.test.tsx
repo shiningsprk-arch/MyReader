@@ -10,7 +10,10 @@ const h = vi.hoisted(() => {
   };
   const makeStore = <T,>(state: T): MockStore<T> => {
     const listeners = new Set<() => void>();
-    const store = (() => state) as MockStore<T>;
+    // Selector-aware like zustand's hook: the sync hook reads `currentUserId`
+    // through `useMyBooksStatusStore((s) => s.currentUserId)`.
+    const store = ((selector?: (state: T) => unknown) =>
+      selector ? selector(state) : state) as MockStore<T>;
     store.getState = () => state;
     store.subscribe = (listener) => {
       listeners.add(listener);
@@ -25,9 +28,15 @@ const h = vi.hoisted(() => {
       location: string;
       updatedAt: number;
       booknotes?: BookNote[];
+      lastSyncedAtNotes?: number;
       pendingReadingSeconds?: Record<string, number>;
+      lastSyncedAtConfig?: number;
+      locationUpdatedAt?: number;
+      rawAnchor?: unknown;
+      rawAnchorCleared?: boolean;
+      migratedRemoteUpdatedAt?: number;
     },
-    progress: { location: 'local-loc' } as { location: string } | null,
+    progress: { location: 'local-loc' } as { location: string; source?: string } | null,
     previewMode: false,
     inited: true,
     error: null as string | null,
@@ -39,6 +48,7 @@ const h = vi.hoisted(() => {
       resolveCFI?: (cfi: string) => { index: number; anchor: (doc: unknown) => unknown };
     },
   };
+  const setProgressSourceMock = vi.fn();
   const readerStore = makeStore({
     getProgress: () => state.progress,
     getViewState: () =>
@@ -46,12 +56,15 @@ const h = vi.hoisted(() => {
         ? null
         : { previewMode: state.previewMode, inited: state.inited, error: state.error },
     getView: () => state.view,
+    getViewSettings: () => null,
+    setProgressSource: setProgressSourceMock,
   });
 
   return {
     makeStore,
     state,
     readerStore,
+    setProgressSourceMock,
     // `configs`/`notes` are intentionally loose: tests below resolve both a
     // `null` payload and a populated one.
     pullSyncMock: vi.fn(
@@ -62,10 +75,13 @@ const h = vi.hoisted(() => {
     ),
     pushSyncMock: vi.fn(async (_payload: unknown) => ({})),
     setConfigMock: vi.fn(),
-    saveConfigMock: vi.fn(async () => {}),
-    goToMock: vi.fn(),
+    saveConfigMock: vi.fn(async (..._args: unknown[]) => {}),
+    goToMock: vi.fn(async (_target: string) => {}),
+    ensureCurrentUserIdMock: vi.fn(async (): Promise<number | null> => 1),
+    identityVerified: true,
+    identitySettled: true,
     mybooksStatus: {
-      currentUserId: 1,
+      currentUserId: 1 as number | null,
       showOtherAnnotations: true,
       sysInfo: null as { timezone?: string | null } | null,
     },
@@ -98,6 +114,10 @@ vi.mock('@/store/readerStore', () => ({
   useReaderStore: h.readerStore,
 }));
 
+vi.mock('@/store/readerProgressStore', () => ({
+  useBookProgress: () => h.state.progress,
+}));
+
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: h.makeStore({ settings: { version: 1 } }),
 }));
@@ -116,6 +136,12 @@ vi.mock('@/services/mybooks/syncClient', () => ({
   SyncApiError: class SyncApiError extends Error {},
 }));
 
+vi.mock('@/services/mybooksService', () => ({
+  ensureCurrentUserId: () => h.ensureCurrentUserIdMock(),
+  isCurrentUserIdVerified: () => h.identityVerified,
+  isCurrentUserIdSettled: () => h.identitySettled,
+}));
+
 vi.mock('../hooks/useWindowActiveChanged', () => ({
   useWindowActiveChanged: () => {},
 }));
@@ -124,17 +150,88 @@ vi.mock('../hooks/useNativeSyncEvents', () => ({
   useNativeSyncEvents: () => {},
 }));
 
+const rawLocationMocks = vi.hoisted(() => ({
+  resolveRawAnchorToCfi: vi.fn(
+    async (..._args: unknown[]): Promise<{ cfi: string; mode: 'exact' | 'approx' } | null> => ({
+      cfi: 'remote-loc',
+      mode: 'exact',
+    }),
+  ),
+  resolveLegacyCfiToLocal: vi.fn(
+    async (..._args: unknown[]): Promise<{ cfi: string; index: number } | null> => ({
+      cfi: 'remote-loc',
+      index: 0,
+    }),
+  ),
+  buildRawAnchorForRange: vi.fn(async () => ({
+    v: 2 as const,
+    index: 0,
+    rawOffset: 10,
+    rawFraction: 0.1,
+    rawQuote: 'quote',
+    sectionHash: 'hash',
+    rawTextVersion: 1,
+    precision: 'exact' as const,
+  })),
+  isCfiWithinRange: vi.fn((_target?: string, _visible?: string) => true),
+  sectionFractionOf: vi.fn(() => 0.5),
+  resetLocationCaches: vi.fn(),
+}));
+
+vi.mock('@/services/mybooks/rawLocation', () => rawLocationMocks);
+
 import { useNativeSync } from '@/app/reader/hooks/useNativeSync';
+
+const makeRawAnchor = (rawOffset = 10) => ({
+  v: 2 as const,
+  index: 0,
+  rawOffset,
+  rawFraction: 0.1,
+  rawQuote: 'quote',
+  sectionHash: 'hash',
+  rawTextVersion: 1,
+  precision: 'exact' as const,
+});
 
 beforeEach(() => {
   vi.useFakeTimers();
-  h.pullSyncMock.mockClear();
-  h.pushSyncMock.mockClear();
+  // Reset (not just clear): tests install deferred implementations for these
+  // and a leftover one would hang the next test's initial pull.
+  h.pullSyncMock.mockReset();
+  h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+  h.pushSyncMock.mockReset();
+  h.pushSyncMock.mockResolvedValue({});
   h.setConfigMock.mockClear();
   h.saveConfigMock.mockClear();
   h.goToMock.mockClear();
+  h.setProgressSourceMock.mockClear();
+  rawLocationMocks.resolveRawAnchorToCfi.mockClear();
+  rawLocationMocks.resolveLegacyCfiToLocal.mockClear();
+  rawLocationMocks.buildRawAnchorForRange.mockClear();
+  rawLocationMocks.isCfiWithinRange.mockClear();
+  rawLocationMocks.resolveRawAnchorToCfi.mockResolvedValue({
+    cfi: 'remote-loc',
+    mode: 'exact',
+  });
+  rawLocationMocks.resolveLegacyCfiToLocal.mockResolvedValue({
+    cfi: 'remote-loc',
+    index: 0,
+  });
+  rawLocationMocks.buildRawAnchorForRange.mockResolvedValue({
+    v: 2,
+    index: 0,
+    rawOffset: 10,
+    rawFraction: 0.1,
+    rawQuote: 'quote',
+    sectionHash: 'hash',
+    rawTextVersion: 1,
+    precision: 'exact',
+  });
+  rawLocationMocks.isCfiWithinRange.mockImplementation(
+    (target?: string, visible?: string) => target === visible,
+  );
   h.state.config = { location: 'local-loc', updatedAt: 1000 };
-  h.state.progress = { location: 'local-loc' };
+  h.state.progress = { location: 'local-loc', source: 'restore' };
   h.state.previewMode = false;
   h.state.inited = true;
   h.state.error = null;
@@ -144,9 +241,16 @@ beforeEach(() => {
     renderer: new EventTarget(),
     lastLocation: { cfi: 'local-loc' },
   };
+  h.goToMock.mockImplementation(async (target: string) => {
+    h.state.view!.lastLocation = { cfi: target };
+  });
   h.mybooksStatus.currentUserId = 1;
   h.mybooksStatus.showOtherAnnotations = true;
   h.mybooksStatus.sysInfo = null;
+  h.ensureCurrentUserIdMock.mockClear();
+  h.ensureCurrentUserIdMock.mockResolvedValue(1);
+  h.identityVerified = true;
+  h.identitySettled = true;
 });
 
 afterEach(() => {
@@ -168,6 +272,34 @@ const flushMicrotasks = async () => {
 };
 
 describe('useNativeSync', () => {
+  test('holds sync until the reader identity is resolved', async () => {
+    // A pull stamps `userId` onto the reader's own notes. Ownership checks are
+    // strict, so without the numeric id those notes (notably drawings) become
+    // invisible and stop being pushed. Sync therefore must not start before
+    // `/user/whoami` (via ensureCurrentUserId) has resolved the identity.
+    h.mybooksStatus.currentUserId = null;
+    // Resolve through the same store the hook reads, i.e. what the real
+    // ensureCurrentUserId does, rather than poking the field by hand.
+    h.ensureCurrentUserIdMock.mockImplementation(async () => {
+      h.mybooksStatus.currentUserId = 1;
+      return 1;
+    });
+
+    const { rerender } = renderHook(() => useNativeSync('book-key'));
+    await flushPushDebounce();
+
+    expect(h.ensureCurrentUserIdMock).toHaveBeenCalled();
+    // The mocked store doesn't re-render the hook by itself; the render after
+    // the id lands is what makes it sync-ready.
+    expect(h.pullSyncMock).not.toHaveBeenCalled();
+    expect(h.pushSyncMock).not.toHaveBeenCalled();
+
+    rerender();
+    await flushMicrotasks();
+
+    expect(h.pullSyncMock).toHaveBeenCalled();
+  });
+
   test('does not push before the initial pull-on-open has resolved', async () => {
     // Bug: opening a book fires the pull-once effect and the auto-push effect
     // in the same render (both keyed off progress?.location). If pushNow isn't
@@ -203,17 +335,23 @@ describe('useNativeSync', () => {
     renderHook(() => useNativeSync('book-key'));
     await flushMicrotasks();
 
-    expect(h.setConfigMock).toHaveBeenCalledWith(
-      'book-key',
-      expect.objectContaining({ location: 'remote-loc' }),
-    );
-    // The jump itself waits for a quiet gap in the renderer (see #44).
+    // The jump waits for a quiet renderer window (see #44) and the config is
+    // only committed after the landing is verified.
     expect(h.goToMock).not.toHaveBeenCalled();
+    // 1st quiet window: run goTo. 2nd: verify the landing before persisting.
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
     await act(async () => {
       vi.advanceTimersByTime(800);
       for (let i = 0; i < 10; i++) await Promise.resolve();
     });
     expect(h.goToMock).toHaveBeenCalledWith('remote-loc');
+    expect(h.setConfigMock).toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'remote-loc' }),
+    );
   });
 
   test('waits for the renderer to settle before jumping to the pulled position', async () => {
@@ -672,6 +810,54 @@ describe('useNativeSync', () => {
     );
   });
 
+  test('coerces a numeric-string uid instead of treating the note as foreign', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: null,
+      notes: [
+        {
+          id: 'n1',
+          book_hash: 'book-hash',
+          uid: '1',
+          updatedAt: 10,
+          note: 'mine',
+        },
+      ],
+    } as unknown as Awaited<ReturnType<typeof h.pullSyncMock>>);
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    const merged = h.setConfigMock.mock.calls
+      .map((call) => call[1] as { booknotes?: BookNote[] })
+      .find((config) => config?.booknotes);
+    expect(merged?.booknotes?.[0]).toMatchObject({ id: 'n1', userId: '1' });
+  });
+
+  test('treats an author-tagged row without a uid as foreign, never unowned', async () => {
+    // A row that carries author info is someone else's by definition; letting
+    // it land as "no userId" would make the strict ownership checks adopt it.
+    h.pullSyncMock.mockResolvedValue({
+      configs: null,
+      notes: [
+        {
+          id: 'n1',
+          book_hash: 'book-hash',
+          author: { nickname: 'Alice' },
+          updatedAt: 10,
+          note: 'theirs',
+        },
+      ],
+    } as unknown as Awaited<ReturnType<typeof h.pullSyncMock>>);
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    const merged = h.setConfigMock.mock.calls
+      .map((call) => call[1] as { booknotes?: BookNote[] })
+      .find((config) => config?.booknotes);
+    expect(merged?.booknotes?.[0]).toMatchObject({ id: 'n1', userId: 'foreign' });
+  });
+
   test('drops a locally-cached note the server no longer returns, once it was already synced', async () => {
     // Bug: pullNow's merge only ever adds/updates ids present in the
     // response — it never reconciles a local note whose id is *missing*
@@ -760,10 +946,14 @@ describe('useNativeSync', () => {
 
     // 20s 时攒下第一段 10s（首个 tick 只记 lastTickAt）；等 keepalive（60s 间隔、
     // 距上次 push 也要满 60s）把它带走——普通 debounce push 发生在攒到秒数之前。
-    await act(async () => {
-      vi.advanceTimersByTime(125_000);
-      for (let i = 0; i < 10; i++) await Promise.resolve();
-    });
+    // Advance in steps so the push in flight can resolve; otherwise every
+    // keepalive ticks while the first request is still pending and skips.
+    for (let step = 0; step < 5; step++) {
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      });
+    }
 
     const withSeconds = h.pushSyncMock.mock.calls
       .map((call) => call[0] as { reading_seconds?: { date: string; seconds: number }[] })
@@ -795,6 +985,30 @@ describe('useNativeSync', () => {
     );
   });
 
+  test('does not push while the identity is still unverified', async () => {
+    // A cached-but-unverified id could filter notes with the wrong account and
+    // let the server stamp them under the current session; pushes wait for the
+    // first whoami attempt to settle.
+    h.identitySettled = false;
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+
+    const { rerender } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    expect(h.pushSyncMock).not.toHaveBeenCalled();
+
+    // A later local change (after identity settled) pushes normally. A user
+    // turn is what advances the position; a source-less relocate is
+    // display-only and must not push.
+    h.identitySettled = true;
+    h.state.progress = { location: 'second-loc', source: 'user' };
+    rerender();
+    await flushPushDebounce();
+
+    expect(h.pushSyncMock).toHaveBeenCalled();
+  });
+
   test('does not push back a note that belongs to another user', async () => {
     h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
     h.state.config = {
@@ -816,5 +1030,710 @@ describe('useNativeSync', () => {
     expect(h.pushSyncMock).toHaveBeenCalled();
     const payload = h.pushSyncMock.mock.calls[0]![0] as { notes: { id: string }[] };
     expect(payload.notes.map((n) => n.id)).toEqual(['mine', 'local']);
+  });
+
+  test('never sweeps a local drawing that the remote snapshot lacks', async () => {
+    const ink: BookNote = {
+      id: 'ink1',
+      type: 'ink',
+      cfi: 'epubcfi(/6/10)',
+      note: '',
+      createdAt: 1000,
+      updatedAt: 1500,
+      ink: [{ id: 's1', color: '#000', width: 0.004, points: [[0.1, 0.1]] }],
+    };
+    h.state.config = {
+      location: 'local-loc',
+      updatedAt: 1000,
+      lastSyncedAtNotes: 999_999, // older than the drawing, so the old sweep would drop it
+      booknotes: [ink],
+    };
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: [] });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    const merged = h.setConfigMock.mock.calls
+      .map((call) => call[1] as { booknotes?: BookNote[] })
+      .find((config) => config?.booknotes);
+    expect(merged?.booknotes?.some((note) => note.id === 'ink1')).toBe(true);
+  });
+
+  test('keeps local strokes when a live remote row carries no ink', async () => {
+    const ink: BookNote = {
+      id: 'ink1',
+      type: 'ink',
+      cfi: 'epubcfi(/6/10)',
+      note: '',
+      createdAt: 1000,
+      updatedAt: 1000,
+      ink: [{ id: 's1', color: '#000', width: 0.004, points: [[0.1, 0.1]] }],
+    };
+    h.state.config = { location: 'local-loc', updatedAt: 1000, booknotes: [ink] };
+    h.pullSyncMock.mockResolvedValue({
+      configs: null,
+      notes: [{ ...ink, updatedAt: 5000, ink: [] }],
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    const merged = h.setConfigMock.mock.calls
+      .map((call) => call[1] as { booknotes?: BookNote[] })
+      .find((config) => config?.booknotes);
+    const stored = merged?.booknotes?.find((note) => note.id === 'ink1');
+    expect(stored?.ink).toHaveLength(1);
+  });
+
+  test('applies a raw anchor and preserves the server record timestamp', async () => {
+    const anchor = { ...makeRawAnchor(120), updatedAt: 2000 };
+    rawLocationMocks.resolveRawAnchorToCfi.mockResolvedValue({
+      cfi: 'anchor-loc',
+      mode: 'exact',
+    });
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+          raw_anchor: anchor,
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(rawLocationMocks.resolveRawAnchorToCfi).toHaveBeenCalledWith(
+      'book-key',
+      expect.anything(),
+      anchor,
+      null,
+    );
+    expect(h.goToMock).toHaveBeenCalledWith('anchor-loc');
+    expect(h.setConfigMock).toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({
+        location: 'anchor-loc',
+        rawAnchor: anchor,
+        updatedAt: 2000,
+      }),
+    );
+    expect(
+      h.saveConfigMock.mock.calls.some(
+        (call) => (call[4] as { preserveUpdatedAt?: boolean } | undefined)?.preserveUpdatedAt,
+      ),
+    ).toBe(true);
+  });
+
+  test('ignores an anchor older than the record it is attached to', async () => {
+    // A client that does not send anchors keeps pushing `location` with a
+    // fresh `updated_at` while the server retains our stale `raw_anchor`.
+    const staleAnchor = { ...makeRawAnchor(120), updatedAt: 1000 };
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+          raw_anchor: staleAnchor,
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(rawLocationMocks.resolveRawAnchorToCfi).not.toHaveBeenCalled();
+    expect(rawLocationMocks.resolveLegacyCfiToLocal).toHaveBeenCalled();
+    expect(h.goToMock).toHaveBeenCalledWith('remote-loc');
+  });
+
+  test('ignores an anchor that carries no position clock', async () => {
+    // Anchors written before `updatedAt` existed cannot prove they describe
+    // the record they travel with; they fall back to location + LWW.
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+          raw_anchor: makeRawAnchor(120),
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(rawLocationMocks.resolveRawAnchorToCfi).not.toHaveBeenCalled();
+    expect(rawLocationMocks.resolveLegacyCfiToLocal).toHaveBeenCalled();
+    expect(h.goToMock).toHaveBeenCalledWith('remote-loc');
+  });
+
+  test('a stale anchor does not grant server authority over a newer local position', async () => {
+    h.state.config = {
+      location: 'local-loc',
+      updatedAt: 1000,
+      locationUpdatedAt: 3000,
+    };
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+          raw_anchor: { ...makeRawAnchor(120), updatedAt: 1000 },
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(rawLocationMocks.resolveRawAnchorToCfi).not.toHaveBeenCalled();
+    expect(rawLocationMocks.resolveLegacyCfiToLocal).not.toHaveBeenCalled();
+    expect(h.goToMock).not.toHaveBeenCalled();
+  });
+
+  test('does not undo an anchor clear that landed during the push', async () => {
+    const resolvers: Array<(value: unknown) => void> = [];
+    const { result } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    h.pushSyncMock.mockImplementation(
+      () => new Promise((resolve) => resolvers.push(resolve)) as never,
+    );
+    const first = result.current.pushNow();
+    await flushMicrotasks();
+    expect(resolvers).toHaveLength(1);
+
+    // A newer position was persisted (and its anchor invalidated) mid-flight.
+    h.state.config = {
+      location: 'epubcfi(/6/4!/4/2/1:9)',
+      updatedAt: 6000,
+      locationUpdatedAt: 6000,
+      rawAnchorCleared: true,
+    };
+    await act(async () => {
+      resolvers[0]!({});
+      await first;
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    const synced = h.setConfigMock.mock.calls.at(-1)?.[1] as {
+      rawAnchorCleared?: boolean;
+      location?: string;
+    };
+    expect(synced.location).toBe('epubcfi(/6/4!/4/2/1:9)');
+    expect(synced.rawAnchorCleared).toBe(true);
+  });
+
+  test('re-runs a pull requested while another pull is in flight', async () => {
+    const resolvers: Array<(value: unknown) => void> = [];
+    h.pullSyncMock.mockImplementation(
+      () => new Promise((resolve) => resolvers.push(resolve)) as never,
+    );
+
+    const { result } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    expect(resolvers).toHaveLength(1);
+
+    const queued = result.current.pullNow();
+    await flushMicrotasks();
+    expect(resolvers).toHaveLength(1);
+
+    await act(async () => {
+      resolvers[0]!({ configs: null, notes: null });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    expect(resolvers).toHaveLength(2);
+    await act(async () => {
+      resolvers[1]!({ configs: null, notes: null });
+      await queued;
+    });
+  });
+
+  test('re-runs a push requested while another push is in flight', async () => {
+    const resolvers: Array<(value: unknown) => void> = [];
+    const { result } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    h.pushSyncMock.mockImplementation(
+      () => new Promise((resolve) => resolvers.push(resolve)) as never,
+    );
+    const first = result.current.pushNow();
+    await flushMicrotasks();
+    expect(resolvers).toHaveLength(1);
+
+    // A change that lands while the first push is still in flight.
+    h.state.config = {
+      location: 'epubcfi(/6/4!/4/2/1:7)',
+      updatedAt: 5000,
+      locationUpdatedAt: Number.MAX_SAFE_INTEGER,
+    };
+    void result.current.pushNow();
+    await flushMicrotasks();
+    expect(resolvers).toHaveLength(1);
+
+    await act(async () => {
+      resolvers[0]!({});
+      await first;
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    expect(resolvers).toHaveLength(2);
+    const queuedPayload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: { location?: string }[];
+    };
+    expect(queuedPayload.configs?.[0]?.location).toBe('epubcfi(/6/4!/4/2/1:7)');
+    await act(async () => {
+      resolvers[1]!({});
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+  });
+
+  test('does not apply a remote location that cannot be resolved locally', async () => {
+    rawLocationMocks.resolveRawAnchorToCfi.mockResolvedValue(null);
+    rawLocationMocks.resolveLegacyCfiToLocal.mockResolvedValue(null);
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).not.toHaveBeenCalled();
+    expect(h.setConfigMock).not.toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'epubcfi(/6/4!/4/2/1:5)' }),
+    );
+  });
+
+  test('migrates a legacy record from MyBooks even when the local timestamp is newer', async () => {
+    h.state.config = { location: 'local-loc', updatedAt: 5000 };
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).toHaveBeenCalledWith('remote-loc');
+  });
+
+  test('pushes the collapsed location, locationUpdatedAt and raw anchor', async () => {
+    const anchor = makeRawAnchor(120);
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+    h.state.config = {
+      location: 'epubcfi(/6/4!/4/2/1:5)',
+      updatedAt: 1000,
+      locationUpdatedAt: 3000,
+      rawAnchor: anchor,
+    };
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    const payload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: { updated_at: number; location: string; raw_anchor: unknown }[];
+    };
+    expect(payload.configs?.[0]?.updated_at).toBe(3000);
+    expect(payload.configs?.[0]?.location).toBe('epubcfi(/6/4!/4/2/1:5)');
+    expect(payload.configs?.[0]?.raw_anchor).toEqual(anchor);
+  });
+
+  test('a user turn during a pull is not overwritten by the remote snapshot', async () => {
+    let resolvePull: (value: unknown) => void = () => {};
+    h.pullSyncMock.mockImplementation(
+      () => new Promise((resolve) => (resolvePull = resolve)) as never,
+    );
+
+    const { rerender } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+
+    h.state.progress = { location: 'user-turn', source: 'user' };
+    rerender();
+    await flushMicrotasks();
+
+    resolvePull({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'remote-loc',
+        },
+      ],
+      notes: null,
+    });
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).not.toHaveBeenCalled();
+    expect(h.setConfigMock).not.toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'remote-loc' }),
+    );
+  });
+
+  test('clears the server anchor when the position advanced without one', async () => {
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+    h.state.config = {
+      location: 'epubcfi(/6/4!/4/2/1:5)',
+      updatedAt: 1000,
+      locationUpdatedAt: 3000,
+      rawAnchorCleared: true,
+    };
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    const payload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: { raw_anchor: unknown }[];
+    };
+    expect(payload.configs?.[0]?.raw_anchor).toBeNull();
+  });
+
+  test('does not repeat the server-truth migration for the same legacy record', async () => {
+    h.state.config = {
+      location: 'local-loc',
+      updatedAt: 5000,
+      migratedRemoteUpdatedAt: 2000,
+    };
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).not.toHaveBeenCalled();
+  });
+
+  test('skips goTo when the target is already on the visible page', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+    h.state.view!.lastLocation = { cfi: 'epubcfi(/6/4!/4/2/1:5)' };
+    rawLocationMocks.resolveLegacyCfiToLocal.mockResolvedValue({
+      cfi: 'epubcfi(/6/4!/4/2/1:5)',
+      index: 0,
+    });
+    rawLocationMocks.isCfiWithinRange.mockReturnValue(true);
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).not.toHaveBeenCalled();
+    expect(h.setConfigMock).toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'epubcfi(/6/4!/4/2/1:5)' }),
+    );
+  });
+
+  test('bounds the layout wait instead of hanging the pull forever', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+    // A resolvable range with no geometry, forever — the old loop would never
+    // exit and every later pull would queue behind it.
+    const zeroRectRange = {
+      collapsed: false,
+      getClientRects: () => [] as DOMRect[],
+    } as unknown as Range;
+    h.state.view!.resolveCFI = () => ({
+      index: 0,
+      anchor: () => zeroRectRange,
+    });
+    (h.state.view!.renderer as EventTarget & { getContents?: () => unknown[] }).getContents =
+      () => [{ doc: document, index: 0 }];
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 6; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).toHaveBeenCalledWith('remote-loc');
+  });
+
+  test('does not apply a remote location while a deep link is previewed', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+    h.state.previewMode = true;
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    expect(h.goToMock).not.toHaveBeenCalled();
+    expect(h.setConfigMock).not.toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'epubcfi(/6/4!/4/2/1:5)' }),
+    );
+  });
+
+  test('omits raw_anchor entirely when there is neither an anchor nor a pending clear', async () => {
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+    h.state.config = {
+      location: 'epubcfi(/6/4!/4/2/1:5)',
+      updatedAt: 1000,
+    };
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    const payload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: Record<string, unknown>[];
+    };
+    expect(payload.configs?.[0]).toBeDefined();
+    expect('raw_anchor' in payload.configs![0]!).toBe(false);
+  });
+
+  test('a user turn after a remote apply is still pushed', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+
+    const { rerender } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+    h.pushSyncMock.mockClear();
+
+    const userLocation = 'epubcfi(/6/4!/4/2/1:1)';
+    h.state.config = {
+      location: userLocation,
+      updatedAt: 3000,
+      locationUpdatedAt: 3000,
+    };
+    h.state.progress = { location: userLocation, source: 'user' };
+    rerender();
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    const payload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: { location: string; updated_at: number }[];
+    };
+    expect(payload.configs?.[0]?.location).toBe(userLocation);
+    expect(payload.configs?.[0]?.updated_at).toBe(3000);
+  });
+
+  test('pushes a TTS sentence follow as a config change', async () => {
+    h.pullSyncMock.mockResolvedValue({ configs: null, notes: null });
+    const { rerender } = renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    await flushPushDebounce();
+    h.pushSyncMock.mockClear();
+
+    // `setProgressLocation` advances the clock and tags the record 'tts'.
+    // A listening position is a real position: configs must be pushed even
+    // though no page turn happened.
+    const spokenLocation = 'epubcfi(/6/4!/4/2/1:9)';
+    h.state.config = {
+      location: spokenLocation,
+      updatedAt: 3000,
+      locationUpdatedAt: 5000,
+      lastSyncedAtConfig: 3000,
+    };
+    h.state.progress = { location: spokenLocation, source: 'tts' };
+    rerender();
+    await flushMicrotasks();
+    await flushPushDebounce();
+
+    const payload = h.pushSyncMock.mock.calls.at(-1)![0] as {
+      configs?: { location: string; updated_at: number }[];
+    };
+    expect(payload.configs?.[0]?.location).toBe(spokenLocation);
+    expect(payload.configs?.[0]?.updated_at).toBe(5000);
+  });
+
+  test('an unverified landing is not promoted to a user position and is reverted', async () => {
+    h.pullSyncMock.mockResolvedValue({
+      configs: [
+        {
+          id: 'book-hash',
+          book_hash: 'book-hash',
+          updatedAt: 2000,
+          progress: [1, 450],
+          location: 'epubcfi(/6/4!/4/2/1:5)',
+        },
+      ],
+      notes: null,
+    });
+    rawLocationMocks.resolveLegacyCfiToLocal.mockResolvedValue({
+      cfi: 'remote-loc',
+      index: 0,
+    });
+    rawLocationMocks.isCfiWithinRange.mockReturnValue(false);
+
+    renderHook(() => useNativeSync('book-key'));
+    await flushMicrotasks();
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(800);
+        for (let j = 0; j < 10; j++) await Promise.resolve();
+      });
+    }
+
+    // Applied target, then reverted to the previous position.
+    expect(h.goToMock.mock.calls.map((call) => call[0])).toEqual(['remote-loc', 'local-loc']);
+    expect(h.setProgressSourceMock).toHaveBeenCalledWith('book-key', 'remote');
+    expect(h.setProgressSourceMock).not.toHaveBeenCalledWith('book-key', 'user');
+    expect(h.setConfigMock).not.toHaveBeenCalledWith(
+      'book-key',
+      expect.objectContaining({ location: 'remote-loc' }),
+    );
   });
 });

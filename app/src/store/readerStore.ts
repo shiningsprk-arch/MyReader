@@ -5,6 +5,7 @@ import {
   BookConfig,
   PageInfo,
   BookProgress,
+  ProgressSource,
   ViewSettings,
   TimeInfo,
   FIXED_LAYOUT_FORMATS,
@@ -21,7 +22,13 @@ import {
 import type { FileSystem } from '@/types/system';
 import { isFeedBookUrl, parseFeedBookUrl } from '@/services/rss/feedBookUrl';
 import { openFeedBookDoc } from '@/services/rss/feedReader';
-import { BOOK_NAV_VERSION, computeBookNav, hydrateBookNav, updateToc } from '@/services/nav';
+import {
+  BOOK_NAV_VERSION,
+  computeBookNav,
+  findTocItemBS,
+  hydrateBookNav,
+  updateToc,
+} from '@/services/nav';
 import {
   formatAuthors,
   formatTitle,
@@ -59,6 +66,26 @@ const scheduleReadingStatus = (hash: string) => {
   );
 };
 
+const updateLibraryReadingProgress = (id: string, pageInfo: PageInfo, persistable = true) => {
+  // Remote/restore positions are display-only; don't let their fallback page
+  // move the shelf's "continue reading" percentage either.
+  if (!persistable) return;
+  const progress: [number, number] = [pageInfo.current + 1, pageInfo.total];
+  const progressPercentage = Math.round((progress[0] / progress[1]) * 100);
+  // Lightweight library update — O(1) lookup, no array copy, no refreshGroups
+  const { getBookByHash, updateBookProgress } = useLibraryStore.getState();
+  const existingBook = getBookByHash(id);
+  if (!existingBook) return;
+  let newReadingStatus = existingBook.readingStatus;
+  if (existingBook.readingStatus === 'unread') {
+    scheduleReadingStatus(id);
+  }
+  if (progressPercentage >= 100 && existingBook.readingStatus !== 'finished') {
+    newReadingStatus = 'finished';
+  }
+  updateBookProgress(id, progress, newReadingStatus);
+};
+
 const cancelReadingStatus = (hash: string) => {
   clearTimeout(readingStatusTimers.get(hash));
   readingStatusTimers.delete(hash);
@@ -78,6 +105,9 @@ interface ViewState {
      `getBookProgress(key)` for one-shot reads. */
   ribbonVisible: boolean;
   ttsEnabled: boolean;
+  /* True while the handwriting (drawing) dock is engaged for this view;
+     session-only, never persisted. */
+  drawingEnabled: boolean;
   /* True while an Auto Scroll session (#4998) is engaged for this view;
      session-only, never persisted. Drives the View menu checkmark. */
   autoScrollEnabled: boolean;
@@ -89,6 +119,10 @@ interface ViewState {
      so the user's actual last-read position isn't overwritten by a preview.
      Cleared on the first user-initiated relocate (page turn / scroll). */
   previewMode: boolean;
+  /* Where the current reading position came from. Only `user`/`tts`
+     positions may advance the persisted/synced location; `remote` and
+     `restore` relocates are display-only until the user actually reads. */
+  progressSource: ProgressSource;
   /* View settings for the view:
     generally view settings have a hierarchy of global settings < book settings < view settings
     view settings for primary view are saved to book config which is persisted to config file
@@ -109,6 +143,7 @@ interface ReaderStore {
   setBottomBarTab: (tab: string) => void;
   setBookmarkRibbonVisibility: (key: string, visible: boolean) => void;
   setTTSEnabled: (key: string, enabled: boolean) => void;
+  setDrawingEnabled: (key: string, enabled: boolean) => void;
   setAutoScrollEnabled: (key: string, enabled: boolean) => void;
   setIsLoading: (key: string, loading: boolean) => void;
   setIsSyncing: (key: string, syncing: boolean) => void;
@@ -121,6 +156,15 @@ interface ReaderStore {
     pageinfo: PageInfo,
     timeinfo: TimeInfo,
     range: Range,
+    fraction: number,
+    source?: ProgressSource,
+  ) => void;
+  setProgressLocation: (key: string, location: string, range?: Range | null) => void;
+  setProgressPageInfo: (
+    key: string,
+    section: PageInfo,
+    pageinfo: PageInfo,
+    timeinfo: TimeInfo,
     fraction: number,
   ) => void;
   getProgress: (key: string) => BookProgress | null;
@@ -144,6 +188,7 @@ interface ReaderStore {
   setGridInsets: (key: string, insets: Insets | null) => void;
   setViewInited: (key: string, inited: boolean) => void;
   setPreviewMode: (key: string, previewMode: boolean) => void;
+  setProgressSource: (key: string, source: ProgressSource) => void;
   recreateViewer: (envConfig: EnvConfigType, key: string) => void;
 }
 
@@ -209,10 +254,12 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           error: null,
           ribbonVisible: false,
           ttsEnabled: false,
+          drawingEnabled: false,
           autoScrollEnabled: false,
           syncing: false,
           gridInsets: null,
           previewMode: false,
+          progressSource: 'restore',
           viewSettings: null,
         },
       },
@@ -412,10 +459,12 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             error: null,
             ribbonVisible: false,
             ttsEnabled: false,
+            drawingEnabled: false,
             autoScrollEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
+            progressSource: 'restore',
             viewSettings: { ...globalViewSettings, ...configViewSettings },
           },
         },
@@ -436,10 +485,12 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             error: 'Failed to load book.',
             ribbonVisible: false,
             ttsEnabled: false,
+            drawingEnabled: false,
             autoScrollEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
+            progressSource: 'restore',
             viewSettings: null,
           },
         },
@@ -495,38 +546,27 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     timeinfo: TimeInfo,
     range: Range,
     fraction: number,
+    source: ProgressSource = 'user',
   ) => {
     const id = getBookHash(key);
     const bookData = useBookDataStore.getState().booksData[id];
     const viewState = get().viewStates[key];
     if (!viewState || !bookData) return;
+    const persistable = source === 'user' || source === 'tts';
 
     const pageInfo = bookData.isFixedLayout ? section : pageinfo;
     const progress: [number, number] = [pageInfo.current + 1, pageInfo.total];
-    const progressPercentage = Math.round((progress[0] / progress[1]) * 100);
-
-    // Lightweight library update — O(1) lookup, no array copy, no refreshGroups
-    const { getBookByHash, updateBookProgress } = useLibraryStore.getState();
-    const existingBook = getBookByHash(id);
-    if (existingBook) {
-      let newReadingStatus = existingBook.readingStatus;
-      if (existingBook.readingStatus === 'unread') {
-        scheduleReadingStatus(id);
-      }
-      if (progressPercentage >= 100 && existingBook.readingStatus !== 'finished') {
-        newReadingStatus = 'finished';
-      }
-      updateBookProgress(id, progress, newReadingStatus);
-    }
+    updateLibraryReadingProgress(id, pageInfo, persistable);
 
     // Only the primary view persists progress into the shared bookData
-    // config — secondary views in a parallel layout shouldn't overwrite
-    // it. Skip the bookDataStore write entirely when not primary to spare
-    // its subscribers a re-render.
-    if (viewState.isPrimary) {
+    // config — secondary views in a parallel layout shouldn't overwrite it.
+    // Remote/restore relocates are display-only: writing them here is how a
+    // fallback page used to become the new reading position (#44).
+    if (viewState.isPrimary && persistable) {
       useBookDataStore.setState((state) => {
         const existing = state.booksData[id];
-        if (!existing) return state;
+        if (!existing?.config) return state;
+        const locationChanged = existing.config.location !== location;
         return {
           booksData: {
             ...state.booksData,
@@ -536,6 +576,16 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
                 ...existing.config,
                 progress,
                 location,
+                ...(locationChanged
+                  ? {
+                      locationUpdatedAt: Date.now(),
+                      // The old anchor describes the old position; keep the
+                      // pair atomic by invalidating it until the async
+                      // anchor for this new location lands.
+                      rawAnchor: undefined,
+                      rawAnchorCleared: true,
+                    }
+                  : {}),
               } as BookConfig,
             },
           },
@@ -560,6 +610,131 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       index: section.current,
       range,
       page: pageInfo.current + 1,
+      source,
+    } as BookProgress);
+  },
+  // TTS sentence marks are the progress authority while listening; layout
+  // reflows must not overwrite the synced location with a page-start CFI.
+  setProgressLocation: (key: string, location: string, range?: Range | null) => {
+    const id = getBookHash(key);
+    const viewState = get().viewStates[key];
+    if (!viewState) return;
+    if (viewState.isPrimary) {
+      useBookDataStore.setState((state) => {
+        const existing = state.booksData[id];
+        if (!existing) return state;
+        if (existing.config?.location === location) return state;
+        return {
+          booksData: {
+            ...state.booksData,
+            [id]: {
+              ...existing,
+              config: {
+                ...existing.config,
+                location,
+                // Listening moves the reading position just like a page turn:
+                // advance the clock (MyBooks/WebDAV compare it against the
+                // last synced value to decide what to push) and drop the
+                // anchor that described the previous spot — the push path
+                // rebuilds one for this position instead of pairing a stale
+                // anchor with a newer CFI.
+                locationUpdatedAt: Date.now(),
+                rawAnchor: undefined,
+                rawAnchorCleared: true,
+              } as BookConfig,
+            },
+          },
+        };
+      });
+    }
+    const progress = getBookProgress(key);
+    if (progress) {
+      // Sentence CFIs are the location authority while listening, and the
+      // relocate path that normally refreshes the section fields is
+      // suppressed. Keep the chapter index/label in sync or the lock-screen
+      // title stays on the old chapter and the next TTS start pairs a
+      // new-chapter range with a stale section index.
+      const bookData = useBookDataStore.getState().booksData[id];
+      let index = progress.index;
+      try {
+        index = get().getView(key)?.resolveCFI(location)?.index ?? index;
+      } catch {
+        // Unresolvable CFI: keep the last known section index.
+      }
+      const tocItem = bookData?.bookDoc?.toc ? findTocItemBS(bookData.bookDoc.toc, location) : null;
+      setBookProgress(key, {
+        ...progress,
+        location,
+        // A moved position with no range (the cross-section call) must not
+        // keep the previous section's range: the push path would build an
+        // anchor from that stale window and emit a wrong `approx` position.
+        // The next sentence carries a range again.
+        range: range ?? (progress.location === location ? progress.range : undefined),
+        index,
+        section:
+          progress.section != null ? { ...progress.section, current: index } : progress.section,
+        sectionLabel: tocItem?.label ?? progress.sectionLabel,
+        sectionHref: tocItem?.href ?? progress.sectionHref,
+        // The sync hooks only push positions a reader actually produced;
+        // while listening that is the sentence follow, not a restore/reflow.
+        source: 'tts',
+      } as BookProgress);
+    }
+  },
+  // Listening keeps the sentence CFI as the location authority, so the page
+  // fields come from the TTS follow navigation's own relocate instead. That
+  // relocate is measured on the rendered (transformed) document — the same
+  // basis as a normal page turn — so page info and the library percent stay
+  // current without re-deriving progress from foliate's raw section copy
+  // (`getCFIProgress` parses a fresh section DOM per cold chapter, ~100–300ms,
+  // and its CFI paths do not line up with the transformed text).
+  setProgressPageInfo: (
+    key: string,
+    section: PageInfo,
+    pageinfo: PageInfo,
+    timeinfo: TimeInfo,
+    fraction: number,
+  ) => {
+    const id = getBookHash(key);
+    const viewState = get().viewStates[key];
+    if (!viewState) return;
+    const progress = getBookProgress(key);
+    if (!progress) return;
+    const bookData = useBookDataStore.getState().booksData[id];
+    const pageInfo = bookData?.isFixedLayout ? section : pageinfo;
+    // A relocate with no page total would make the percentage divide by zero
+    // and wrongly promote the book to "finished".
+    if (!pageInfo || !(pageInfo.total > 0)) return;
+    updateLibraryReadingProgress(id, pageInfo);
+
+    // Mirror setProgress: only the primary view persists into the shared
+    // bookData config.
+    if (viewState.isPrimary) {
+      useBookDataStore.setState((state) => {
+        const existing = state.booksData[id];
+        if (!existing) return state;
+        return {
+          booksData: {
+            ...state.booksData,
+            [id]: {
+              ...existing,
+              config: {
+                ...existing.config,
+                progress: [pageInfo.current + 1, pageInfo.total],
+              } as BookConfig,
+            },
+          },
+        };
+      });
+    }
+
+    setBookProgress(key, {
+      ...progress,
+      section,
+      pageinfo,
+      timeinfo,
+      fraction,
+      page: pageInfo.current + 1,
     } as BookProgress);
   },
   setBookmarkRibbonVisibility: (key: string, visible: boolean) =>
@@ -580,6 +755,17 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
         [key]: {
           ...state.viewStates[key]!,
           ttsEnabled: enabled,
+        },
+      },
+    })),
+
+  setDrawingEnabled: (key: string, enabled: boolean) =>
+    set((state) => ({
+      viewStates: {
+        ...state.viewStates,
+        [key]: {
+          ...state.viewStates[key]!,
+          drawingEnabled: enabled,
         },
       },
     })),
@@ -651,6 +837,18 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
         },
       },
     })),
+
+  setProgressSource: (key: string, source: ProgressSource) =>
+    set((state) => {
+      const viewState = state.viewStates[key];
+      if (!viewState || viewState.progressSource === source) return state;
+      return {
+        viewStates: {
+          ...state.viewStates,
+          [key]: { ...viewState, progressSource: source },
+        },
+      };
+    }),
 
   recreateViewer: (envConfig: EnvConfigType, key: string) => {
     const id = getBookHash(key);
